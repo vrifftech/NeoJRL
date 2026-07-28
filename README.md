@@ -2,97 +2,107 @@
 
 [![CI](https://github.com/vrifftech/NeoJRL/actions/workflows/ci.yml/badge.svg)](https://github.com/vrifftech/NeoJRL/actions/workflows/ci.yml)
 
-C++17 JRL/GFF editor core, CLI, and optional wxWidgets desktop GUI.
+NeoJRL is a purpose-aware editor for BioWare `JRL V3.2` journal resources. It supports the related but different journal schemas used by KotOR/KotOR II and Neverwinter Nights/Neverwinter Nights 2.
+
+## Journal profiles
+
+NeoJRL detects the selected category's schema from its fields and adapts the editor accordingly.
+
+### KotOR / KotOR II
+
+Category fields:
+
+```text
+Name            CExoLocString
+Tag             CExoString
+Priority        DWORD
+Picture         WORD
+PlotIndex       INT
+PlanetID        INT
+EntryList       List
+```
+
+Entry fields:
+
+```text
+ID              DWORD
+Text            CExoLocString
+XP_Percentage   FLOAT
+End             WORD used as a Boolean
+```
+
+`PlotIndex` selects a row from `PlotXP.2da`; `XP_Percentage` is a direct multiplier applied to that row's XP (`0.5` means 50%, `1.0` means 100%). `PlanetID`, `PlotIndex`, and `Picture` are data-driven identifiers, so NeoJRL validates their storage types without inventing unsupported maximum values.
+
+### Neverwinter Nights / Neverwinter Nights 2
+
+Category fields:
+
+```text
+Name            CExoLocString
+Tag             CExoString
+Comment         CExoString, authoring metadata
+Priority        DWORD
+Picture         WORD
+XP              DWORD
+EntryList       List
+```
+
+NWN-family entries contain `ID`, `Text`, and `End`; they do not contain KotOR's `XP_Percentage`. NeoJRL no longer adds that field when creating an NWN/NWN2 entry.
+
+Entry IDs are unsigned 32-bit values and must be unique within their category. Deleting an entry does not renumber the remaining IDs.
 
 ## TLK behavior
 
-NeoJRL can open and edit journal files without a TLK. Loading `dialog.tlk` is optional and only resolves StrRef-backed localized strings for preview/search. The lookup parser is supplied by `neoshared`, so NeoJRL does not maintain a separate TLK decoder.
+NeoJRL can open and edit journal files without a TLK. Loading `dialog.tlk` is optional and resolves StrRef-backed names and entry text for preview and search. The TLK parser is supplied by NeoShared.
 
 ## Build
 
-This repository consumes shared code from the separate `neoshared` repository. Clone the repositories as siblings:
+Clone NeoJRL and NeoShared as siblings:
 
 ```text
 workspace/
-  neoshared/
+  NeoShared/
   NeoJRL/
 ```
 
-CMake automatically detects `../neoshared`. For another layout, pass `--neoshared-root /path/to/neoshared` to `build.sh`, `-NeoSharedRoot C:\path\to\neoshared` to `build.ps1`, or set `NEOSHARED_ROOT` directly.
-
+CMake automatically detects `../NeoShared` or `../neoshared`. A different checkout can be supplied with `--neoshared-root`, `-NeoSharedRoot`, or `-DNEOSHARED_ROOT=`.
 
 Linux GUI build:
 
 ```sh
-./scripts/build.sh --wx ON --require-wx ON --jobs "$(nproc)"
+bash ./scripts/build.sh --wx ON --require-wx ON --jobs "$(nproc)" --clean
 ```
 
 Linux CLI/core-only build:
 
 ```sh
-./scripts/build.sh --wx OFF --jobs "$(nproc)"
+bash ./scripts/build.sh --wx OFF --jobs "$(nproc)" --clean
 ```
 
-Windows GUI build with the shared, pinned wxWidgets 3.3.3 overlay:
+Windows GUI build:
 
 ```powershell
-& ..\neoshared\scripts\install-wxwidgets.ps1 `
+& ..\NeoShared\scripts\install-wxwidgets.ps1 `
   -VcpkgRoot C:\vcpkg `
   -Triplet x64-windows-static `
   -CleanAfterBuild
 
 .\scripts\build.ps1 `
+  -Clean `
   -Wx ON `
   -RequireWx ON `
+  -NeoSharedRoot ..\NeoShared `
   -VcpkgRoot C:\vcpkg `
   -VcpkgTriplet x64-windows-static `
   -Parallel ([Environment]::ProcessorCount)
 ```
 
-Use `-Wx OFF` on Windows for a CLI/core-only build. The default build directory is `build/`.
+## Import, export, and patch generation
 
-## Journal entry editing
+The GUI and CLI support full hierarchical XML and JSON interchange. CSV/TSV flattened import is intentionally not exposed because it cannot preserve JRL/GFF structure.
 
-The wxWidgets editor can add and delete quest entries directly in the selected quest's canonical `EntryList`.
-
-**New Entry** appends a standard JRL entry struct containing:
-
-```text
-End            WORD, default 0
-ID             DWORD, next unused quest-local ID
-Text           CExoLocString, default StrRef -1
-XP_Percentage  FLOAT, default 0.0
-```
-
-The new row is selected immediately, and any active entry filters are cleared so it remains visible. **Delete Entry** asks for confirmation, removes only the selected `EntryList` struct, and does not renumber the remaining entry IDs.
-
-## Tabular import/export
-
-`neojrl-cli` supports search plus XML and JSON import/export. XML and JSON use full hierarchical typed GFF/JRL documents. CSV/TSV flattened GFF value-table import/export is intentionally not exposed because it does not preserve the semantic structure of JRL/GFF data. The GUI exposes **Import XML**, **Import JSON**, **Export XML**, and **Export JSON**, plus copy/paste for selected quest/entry fields. Quest and entry filters must be cleared before structured export so the command cannot be mistaken for a partial-document export.
-
-## TSLPatcher/HoloPatcher output
-
-Generate GFF/JRL patcher instructions from original and modified JRL files:
-
-```sh
-neojrl-cli --diff-tslpatcher global_original.jrl global_modified.jrl tslpatchdata --package --filename global.jrl
-neojrl-cli --diff-tslpatcher global_original.jrl global_modified.jrl global_fragment.ini --fragment --filename global.jrl
-```
-
-The generator emits `[GFFList]` field assignments and `AddFieldN` sections for representable scalar/field changes. The generic GFF exporter deliberately rejects newly appended structs under a GFF `List`, including new JRL `EntryList` rows, because a safe installer needs dynamic `TypeId=ListIndex` and `2DAMEMORY` field-path wiring. NeoDLG retains its specialized dynamic implementation for DLG graph nodes. Deleted fields, deleted entries, type changes, structural reorders, and generic list-struct additions are reported as unsupported rather than emitted with brittle fixed indexes.
-
-Native NeoJRL add/delete remains fully supported. For a mod that adds or removes journal entries, distribute a whole replacement `global.jrl` only when that is acceptable for the intended compatibility model; the semantic patch exporter will not pretend the operation is merge-safe.
-
-Patcher generation accepts imported modified-side journal/GFF data: `--modified-format xml|json|jrl|gff|kotor|native|auto` or `--diff-tslpatcher-import`. XML/JSON are full hierarchical GFF documents; native JRL/GFF files can also be compared directly.
-
-Patcher export requires a canonical GFF V3 `JRL ` document containing the journal category list. The GUI exposes package and fragment export under **Export**; unrelated GFF files and GFF V4 files are rejected.
+TSLPatcher/HoloPatcher-oriented comparison output is available for representable scalar and field changes. Generic list-struct additions and structural deletions are reported as unsupported rather than emitted with fixed indexes that would be unsafe during installation.
 
 ## Shared game directories
 
-The wxWidgets application exposes **File > Open Game Directory**. Its submenu lists every saved game install from the shared `neoshared` settings store; selecting an entry opens this application's supported-file dialog with that installation as the starting folder. **Manage Game Directories...** adds, renames, rescans, activates, or removes shared entries, and changes are visible in every Neo tool.
-
-## Continuous integration
-
-GitHub Actions checks out `vrifftech/neoshared` beside this repository, then builds the full wxWidgets application on Ubuntu 24.04 and Windows Server 2025 with Visual Studio 2026. Successful non-pull-request runs publish staged Linux and Windows artifacts.
-
-The shared dependency defaults to `neoshared/main`. Set the repository Actions variable `NEOSHARED_REF` to a release tag or commit SHA to pin normal CI builds. A manual workflow run can override the ref, and the workflow accepts the `neoshared-updated` repository-dispatch event for cross-repository compatibility checks.
+**File > Open Game Directory** opens NeoJRL's file chooser at a saved game installation. The installation registry is shared through NeoShared.

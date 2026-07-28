@@ -30,10 +30,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -242,6 +245,87 @@ bool containsInsensitive(const std::string& haystack, const std::string& needle)
         return true;
     }
     return lowerAscii(haystack).find(lowerAscii(needle)) != std::string::npos;
+}
+
+std::string trimAscii(std::string text) {
+    const auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    });
+    const auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }).base();
+    return first < last ? std::string(first, last) : std::string{};
+}
+
+std::optional<std::int32_t> parseOptionalInt32(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text.empty()) return std::nullopt;
+    std::size_t consumed = 0;
+    const long long value = std::stoll(text, &consumed, 10);
+    if (consumed != text.size() || value < std::numeric_limits<std::int32_t>::min() ||
+        value > std::numeric_limits<std::int32_t>::max()) {
+        throw std::runtime_error(std::string(label) + " must be a signed 32-bit integer.");
+    }
+    return static_cast<std::int32_t>(value);
+}
+
+std::optional<UInt32> parseOptionalDword(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text.empty()) return std::nullopt;
+    std::size_t consumed = 0;
+    const unsigned long long value = std::stoull(text, &consumed, 10);
+    if (consumed != text.size() || value > std::numeric_limits<UInt32>::max()) {
+        throw std::runtime_error(std::string(label) + " must be an unsigned 32-bit integer.");
+    }
+    return static_cast<UInt32>(value);
+}
+
+UInt32 parseRequiredDword(const wxTextCtrl& control, const char* label) {
+    const auto value = parseOptionalDword(control, label);
+    if (!value) throw std::runtime_error(std::string(label) + " is required.");
+    return *value;
+}
+
+UInt32 parseRequiredStrRef(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text == "-1") return kNoStrRef;
+    if (text.empty()) throw std::runtime_error(std::string(label) + " is required and must be -1 or an unsigned 32-bit value.");
+    std::size_t consumed = 0;
+    const unsigned long long value = std::stoull(text, &consumed, 10);
+    if (consumed != text.size() || value > std::numeric_limits<UInt32>::max()) {
+        throw std::runtime_error(std::string(label) + " must be -1 or an unsigned 32-bit value.");
+    }
+    return static_cast<UInt32>(value);
+}
+
+std::optional<std::string> optionalText(const wxTextCtrl& control) {
+    const std::string value = wxui::toStd(control.GetValue());
+    return trimAscii(value).empty() ? std::nullopt : std::optional<std::string>{value};
+}
+
+std::optional<std::uint16_t> parseOptionalWord(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text.empty()) return std::nullopt;
+    std::size_t consumed = 0;
+    const unsigned long long value = std::stoull(text, &consumed, 10);
+    if (consumed != text.size() || value > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::runtime_error(std::string(label) + " must be between 0 and 65535.");
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
+std::optional<float> parseOptionalFloat(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text.empty()) return std::nullopt;
+    std::size_t consumed = 0;
+    const float value = std::stof(text, &consumed);
+    if (consumed != text.size() || !std::isfinite(value)) {
+        throw std::runtime_error(std::string(label) + " must be a finite decimal number.");
+    }
+    if (value < 0.0f) {
+        throw std::runtime_error(std::string(label) + " cannot be negative.");
+    }
+    return value;
 }
 
 
@@ -676,6 +760,8 @@ private:
         searchMode_->Append("PlanetID");
         searchMode_->Append("Priority");
         searchMode_->Append("PlotIndex");
+        searchMode_->Append("Picture");
+        searchMode_->Append("Quest XP");
         searchMode_->SetSelection(0);
         searchRow->Add(searchMode_, 0, wxRIGHT, FromDIP(6));
         searchText_ = new wxTextCtrl(parent, wxID_ANY);
@@ -688,15 +774,25 @@ private:
 
     wxSizer* buildQuestPanel(wxWindow* parent) {
         auto* box = new wxStaticBoxSizer(wxVERTICAL, parent, "Quest");
-        auto* form = new wxFlexGridSizer(3, 4, 5, 8);
+        auto* form = new wxFlexGridSizer(2, 2, 5, 8);
         form->AddGrowableCol(1, 1);
-        form->AddGrowableCol(3, 1);
-        name_ = addText(parent, form, "Name");
+
+        profileLabel_ = new wxStaticText(parent, wxID_ANY, "Detected profile");
+        form->Add(profileLabel_, 0, wxALIGN_CENTER_VERTICAL);
+        profile_ = new wxTextCtrl(parent, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
+        form->Add(profile_, 1, wxEXPAND);
+
+        nameStrRef_ = addText(parent, form, "Name StrRef");
+        name_ = addText(parent, form, "Name text");
+        name_->SetToolTip("When Name StrRef is -1, this edits the embedded language-0 name. Otherwise it shows the resolved TLK text.");
         tag_ = addText(parent, form, "Tag");
         comment_ = addText(parent, form, "Comment");
-        planet_ = addText(parent, form, "PlanetID");
-        priority_ = addText(parent, form, "Priority");
-        plotIndex_ = addText(parent, form, "PlotIndex");
+        priority_ = addText(parent, form, "Sort priority");
+        picture_ = addText(parent, form, "Journal picture ID");
+        planet_ = addText(parent, form, "Planet ID", &planetLabel_);
+        plotIndex_ = addText(parent, form, "PlotXP.2da row", &plotIndexLabel_);
+        questXp_ = addText(parent, form, "Quest XP", &questXpLabel_);
+
         box->Add(form, 0, wxEXPAND | wxALL, 6);
         auto* row = new wxBoxSizer(wxHORIZONTAL);
         row->AddStretchSpacer(1);
@@ -725,7 +821,8 @@ private:
         auto* form = new wxFlexGridSizer(4, 2, 5, 8);
         form->AddGrowableCol(1, 1);
         entryId_ = addText(detailPanel, form, "Entry ID");
-        entryXp_ = addText(detailPanel, form, "XP %");
+        entryXp_ = addText(detailPanel, form, "Plot XP multiplier", &entryXpLabel_);
+        entryXp_->SetToolTip("KotOR multiplies PlotXP.2da XP by this value: 0.5 = 50%, 1.0 = 100%.");
         form->Add(new wxStaticText(detailPanel, wxID_ANY, "End"), 0, wxALIGN_CENTER_VERTICAL);
         entryEnd_ = new wxCheckBox(detailPanel, wxID_ANY, wxEmptyString);
         form->Add(entryEnd_, 0, wxALIGN_CENTER_VERTICAL);
@@ -747,9 +844,15 @@ private:
         return splitter;
     }
 
-    wxTextCtrl* addText(wxWindow* parent, wxSizer* sizer, const char* label) {
-        sizer->Add(new wxStaticText(parent, wxID_ANY, label), 0, wxALIGN_CENTER_VERTICAL);
-        auto* ctrl = new wxTextCtrl(parent, wxID_ANY);
+    wxTextCtrl* addText(wxWindow* parent,
+                        wxSizer* sizer,
+                        const char* label,
+                        wxStaticText** labelOut = nullptr,
+                        long style = 0) {
+        auto* caption = new wxStaticText(parent, wxID_ANY, label);
+        if (labelOut != nullptr) *labelOut = caption;
+        sizer->Add(caption, 0, wxALIGN_CENTER_VERTICAL);
+        auto* ctrl = new wxTextCtrl(parent, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, style);
         sizer->Add(ctrl, 1, wxEXPAND);
         return ctrl;
     }
@@ -1006,13 +1109,34 @@ private:
         }
     }
 
+    void updateQuestFieldVisibility(JournalFlavor flavor) {
+        const bool showKotor = flavor != JournalFlavor::NeverwinterNights;
+        const bool showNwn = flavor != JournalFlavor::Kotor;
+        for (wxWindow* window : {static_cast<wxWindow*>(planetLabel_), static_cast<wxWindow*>(planet_),
+                                 static_cast<wxWindow*>(plotIndexLabel_), static_cast<wxWindow*>(plotIndex_)}) {
+            if (window != nullptr) window->Show(showKotor);
+        }
+        for (wxWindow* window : {static_cast<wxWindow*>(questXpLabel_), static_cast<wxWindow*>(questXp_)}) {
+            if (window != nullptr) window->Show(showNwn);
+        }
+        for (wxWindow* window : {static_cast<wxWindow*>(entryXpLabel_), static_cast<wxWindow*>(entryXp_)}) {
+            if (window != nullptr) window->Show(showKotor);
+        }
+        Layout();
+    }
+
     void clearQuestPanel() {
+        profile_->Clear();
+        nameStrRef_->Clear();
         name_->Clear();
         comment_->Clear();
         tag_->Clear();
         planet_->Clear();
         priority_->Clear();
         plotIndex_->Clear();
+        picture_->Clear();
+        questXp_->Clear();
+        updateQuestFieldVisibility(JournalFlavor::Unknown);
     }
 
     void clearEntryPanel() {
@@ -1042,12 +1166,19 @@ private:
             }
             viewState().primarySelection = questIndex;
             viewState().secondarySelection.reset();
+            JournalFlavor flavor = detectJournalQuestFlavor(gff(), questIndex);
+            if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
+            profile_->SetValue(wxui::toWx(journalFlavorDisplayName(flavor)));
+            updateQuestFieldVisibility(flavor);
+            nameStrRef_->SetValue(wxui::toWx(locStrRefText(*quest, "Name")));
             name_->SetValue(wxui::toWx(locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr)));
             comment_->SetValue(wxui::toWx(fieldText(*quest, "Comment")));
             tag_->SetValue(wxui::toWx(fieldText(*quest, "Tag")));
             planet_->SetValue(wxui::toWx(fieldText(*quest, "PlanetID")));
             priority_->SetValue(wxui::toWx(fieldText(*quest, "Priority")));
             plotIndex_->SetValue(wxui::toWx(fieldText(*quest, "PlotIndex")));
+            picture_->SetValue(wxui::toWx(fieldText(*quest, "Picture")));
+            questXp_->SetValue(wxui::toWx(fieldText(*quest, "XP")));
             refreshEntries(*viewState().primarySelection);
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
@@ -1098,7 +1229,7 @@ private:
         for (std::size_t qi = 0; qi < categories.count(); ++qi) {
             const auto* quest = categories.GetStruct(qi);
             if (!quest) continue;
-            for (const auto& fieldName : {"Tag", "Comment", "PlanetID", "Priority", "PlotIndex"}) {
+            for (const auto& fieldName : {"Tag", "Comment", "PlanetID", "Priority", "Picture", "PlotIndex", "XP"}) {
                 table.rows.push_back({"Quest", std::to_string(qi), "", fieldName, fieldText(*quest, fieldName)});
             }
             table.rows.push_back({"Quest", std::to_string(qi), "", "Name(strref)", locStrRefText(*quest, "Name")});
@@ -1125,7 +1256,7 @@ private:
         const auto& categories = requireCategories(gff());
         const auto* quest = categories.GetStruct(*viewState().primarySelection);
         if (!quest) return table;
-        for (const auto& fieldName : {"Tag", "Comment", "PlanetID", "Priority", "PlotIndex"}) {
+        for (const auto& fieldName : {"Tag", "Comment", "PlanetID", "Priority", "Picture", "PlotIndex", "XP"}) {
             table.rows.push_back({"Quest", std::to_string(*viewState().primarySelection), "", fieldName, fieldText(*quest, fieldName)});
         }
         if (viewState().secondarySelection) {
@@ -1361,17 +1492,33 @@ private:
         try {
             ensureLoaded();
             const long row = wxui::selectedRow(*questList_);
-            if (row < 0) {
-                throw std::runtime_error("Select a quest first.");
-            }
+            if (row < 0) throw std::runtime_error("Select a quest first.");
             const auto index = static_cast<std::size_t>(questList_->GetItemData(row));
-            gff().ChangeFieldValue(pathForQuest(index, "Tag"), wxui::toStd(tag_->GetValue()));
-            gff().ChangeFieldValue(pathForQuest(index, "Comment"), wxui::toStd(comment_->GetValue()));
-            gff().ChangeFieldValue(pathForQuest(index, "PlanetID"), wxui::toStd(planet_->GetValue()));
-            gff().ChangeFieldValue(pathForQuest(index, "Priority"), wxui::toStd(priority_->GetValue()));
-            gff().ChangeFieldValue(pathForQuest(index, "PlotIndex"), wxui::toStd(plotIndex_->GetValue()));
+            JournalFlavor flavor = detectJournalQuestFlavor(gff(), index);
+            if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
+
+            const UInt32 nameStrRef = parseRequiredStrRef(*nameStrRef_, "Name StrRef");
+            setJournalQuestLocalizedString(
+                gff(), index, "Name", nameStrRef,
+                nameStrRef == kNoStrRef ? std::optional<std::string>{wxui::toStd(name_->GetValue())}
+                                        : std::nullopt);
+            setJournalQuestString(gff(), index, "Tag", wxui::toStd(tag_->GetValue()));
+            setJournalQuestOptionalString(gff(), index, "Comment", optionalText(*comment_));
+            setJournalQuestOptionalDword(gff(), index, "Priority", parseOptionalDword(*priority_, "Sort priority"));
+            setJournalQuestOptionalWord(gff(), index, "Picture", parseOptionalWord(*picture_, "Journal picture ID"));
+
+            if (flavor != JournalFlavor::NeverwinterNights) {
+                setJournalQuestOptionalInt(gff(), index, "PlanetID", parseOptionalInt32(*planet_, "Planet ID"));
+                setJournalQuestOptionalInt(gff(), index, "PlotIndex", parseOptionalInt32(*plotIndex_, "PlotXP.2da row"));
+            }
+            if (flavor != JournalFlavor::Kotor) {
+                setJournalQuestOptionalDword(gff(), index, "XP", parseOptionalDword(*questXp_, "Quest XP"));
+            }
+
             refreshQuests();
             selectQuestIndex(index);
+            loadSelectedQuest();
+            updateActiveTabTitle();
             wxui::setStatusText(*this, "Quest changes applied.", 1);
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
@@ -1381,23 +1528,32 @@ private:
     void onApplyEntry(wxCommandEvent&) {
         try {
             ensureLoaded();
-            if (!viewState().primarySelection) {
-                throw std::runtime_error("Select a quest first.");
-            }
+            if (!viewState().primarySelection) throw std::runtime_error("Select a quest first.");
             const long row = wxui::selectedRow(*entryList_);
-            if (row < 0) {
-                throw std::runtime_error("Select an entry first.");
-            }
+            if (row < 0) throw std::runtime_error("Select an entry first.");
+            const auto questIndex = *viewState().primarySelection;
             const auto entryIndex = static_cast<std::size_t>(entryList_->GetItemData(row));
-            gff().ChangeFieldValue(pathForStage(*viewState().primarySelection, entryIndex, "ID"), wxui::toStd(entryId_->GetValue()));
-            gff().ChangeFieldValue(pathForStage(*viewState().primarySelection, entryIndex, "XP_Percentage"), wxui::toStd(entryXp_->GetValue()));
-            gff().ChangeFieldValue(pathForStage(*viewState().primarySelection, entryIndex, "End"), entryEnd_->GetValue() ? "1" : "0");
-            gff().ChangeFieldValue(pathForStage(*viewState().primarySelection, entryIndex, "Text(strref)"), wxui::toStd(entryStrRef_->GetValue()));
-            if (wxui::toStd(entryStrRef_->GetValue()) == "-1") {
-                gff().ChangeFieldValue(pathForStage(*viewState().primarySelection, entryIndex, "Text(lang0)"), wxui::toStd(entryText_->GetValue()));
+            JournalFlavor flavor = detectJournalQuestFlavor(gff(), questIndex);
+            if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
+
+            changeJournalEntryId(gff(), questIndex, entryIndex,
+                                 parseRequiredDword(*entryId_, "Entry ID"));
+            setJournalEntryWord(gff(), questIndex, entryIndex, "End", entryEnd_->GetValue() ? 1u : 0u);
+            if (flavor != JournalFlavor::NeverwinterNights) {
+                setJournalEntryOptionalFloat(gff(), questIndex, entryIndex, "XP_Percentage",
+                                             parseOptionalFloat(*entryXp_, "Plot XP multiplier"));
             }
-            refreshEntries(*viewState().primarySelection);
+
+            const UInt32 textStrRef = parseRequiredStrRef(*entryStrRef_, "Entry StrRef");
+            setJournalEntryLocalizedString(
+                gff(), questIndex, entryIndex, "Text", textStrRef,
+                textStrRef == kNoStrRef ? std::optional<std::string>{wxui::toStd(entryText_->GetValue())}
+                                        : std::nullopt);
+
+            refreshEntries(questIndex);
             selectEntryIndex(entryIndex);
+            loadSelectedEntry();
+            updateActiveTabTitle();
             wxui::setStatusText(*this, "Entry changes applied.", 1);
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
@@ -1679,6 +1835,8 @@ private:
             case 3: return containsInsensitive(fieldText(quest, "PlanetID"), text);
             case 4: return containsInsensitive(fieldText(quest, "Priority"), text);
             case 5: return containsInsensitive(fieldText(quest, "PlotIndex"), text);
+            case 6: return containsInsensitive(fieldText(quest, "Picture"), text);
+            case 7: return containsInsensitive(fieldText(quest, "XP"), text);
             default: return false;
         }
     }
@@ -1730,13 +1888,22 @@ private:
     wxTextCtrl* searchText_ = nullptr;
     wxTextCtrl* filePath_ = nullptr;
     wxTextCtrl* tlkPathText_ = nullptr;
+    wxStaticText* profileLabel_ = nullptr;
+    wxTextCtrl* profile_ = nullptr;
+    wxTextCtrl* nameStrRef_ = nullptr;
     wxTextCtrl* name_ = nullptr;
     wxTextCtrl* comment_ = nullptr;
     wxTextCtrl* tag_ = nullptr;
+    wxStaticText* planetLabel_ = nullptr;
     wxTextCtrl* planet_ = nullptr;
     wxTextCtrl* priority_ = nullptr;
+    wxTextCtrl* picture_ = nullptr;
+    wxStaticText* plotIndexLabel_ = nullptr;
     wxTextCtrl* plotIndex_ = nullptr;
+    wxStaticText* questXpLabel_ = nullptr;
+    wxTextCtrl* questXp_ = nullptr;
     wxTextCtrl* entryId_ = nullptr;
+    wxStaticText* entryXpLabel_ = nullptr;
     wxTextCtrl* entryXp_ = nullptr;
     wxCheckBox* entryEnd_ = nullptr;
     wxTextCtrl* entryStrRef_ = nullptr;
