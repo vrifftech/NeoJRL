@@ -13,10 +13,28 @@ namespace {
 
 std::string normalizedType(std::string value) {
     value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char ch) {
-        return std::isspace(ch) != 0;
+        return ch == 0 || std::isspace(ch) != 0;
     }), value.end());
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
         return static_cast<char>(std::toupper(ch));
+    });
+    return value;
+}
+
+std::string trimAscii(std::string value) {
+    const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    });
+    const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }).base();
+    if (first >= last) return {};
+    return std::string(first, last);
+}
+
+std::string lowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
     });
     return value;
 }
@@ -91,6 +109,67 @@ GffList* findEntryList(GffStruct& quest) {
         throw std::runtime_error("The selected quest has an EntryList field with the wrong GFF type.");
     }
     return &static_cast<GffList&>(*field);
+}
+
+
+std::unordered_set<std::string> collectQuestTags(const GffList& categories,
+                                                 std::optional<std::size_t> excludedIndex = std::nullopt) {
+    std::unordered_set<std::string> tags;
+    for (std::size_t index = 0; index < categories.count(); ++index) {
+        if (excludedIndex && index == *excludedIndex) continue;
+        const GffStruct* quest = categories.GetStruct(index);
+        if (quest == nullptr) {
+            throw std::runtime_error("Categories contains a missing struct at index " +
+                                     std::to_string(index) + ".");
+        }
+        const GffField* tagField = quest->GetFieldByLabel("Tag");
+        if (tagField == nullptr) continue;
+        if (tagField->fieldtype != FIELD_TYPE_CEXOSTRING) {
+            throw std::runtime_error("Quest at index " + std::to_string(index) +
+                                     " has a Tag field with the wrong GFF type.");
+        }
+        const std::string tag = trimAscii(static_cast<const GffExoStringField&>(*tagField).GetString());
+        if (!tag.empty()) tags.insert(lowerAscii(tag));
+    }
+    return tags;
+}
+
+std::string validateQuestTag(const GffList& categories,
+                             std::string tag,
+                             std::optional<std::size_t> excludedIndex = std::nullopt) {
+    tag = trimAscii(std::move(tag));
+    if (tag.empty()) {
+        throw std::runtime_error("A quest tag cannot be empty.");
+    }
+    const auto tags = collectQuestTags(categories, excludedIndex);
+    if (tags.find(lowerAscii(tag)) != tags.end()) {
+        throw std::runtime_error("Quest tag '" + tag +
+                                 "' is already used. Journal quest tags are case-insensitive.");
+    }
+    return tag;
+}
+
+UInt32 nextStructTypeId(const GffList& list) {
+    std::unordered_set<UInt32> used;
+    UInt32 maximum = 0;
+    bool haveAny = false;
+    for (std::size_t index = 0; index < list.count(); ++index) {
+        const GffStruct* structure = list.GetStruct(index);
+        if (structure == nullptr) continue;
+        used.insert(structure->typeid_);
+        maximum = haveAny ? std::max(maximum, structure->typeid_) : structure->typeid_;
+        haveAny = true;
+    }
+    if (!haveAny) return 0;
+    if (maximum != std::numeric_limits<UInt32>::max()) {
+        const UInt32 candidate = maximum + 1u;
+        if (used.find(candidate) == used.end()) return candidate;
+    }
+    for (UInt32 candidate = 0;; ++candidate) {
+        if (used.find(candidate) == used.end()) return candidate;
+        if (candidate == std::numeric_limits<UInt32>::max()) break;
+    }
+    throw std::runtime_error("The GFF list has no available 32-bit struct type IDs.");
 }
 
 GffStruct& requireEntry(GffFile& journal,
@@ -218,6 +297,123 @@ const char* journalFlavorDisplayName(JournalFlavor flavor) {
     case JournalFlavor::Unknown: return "Unknown journal schema";
     }
     return "Unknown journal schema";
+}
+
+
+void initializeJournal(GffFile& journal) {
+    if (!journal.loaded()) {
+        throw std::runtime_error("Create the JRL document before initializing it.");
+    }
+    if (journal.isGff4() || normalizedType(journal.filetype()) != "JRL") {
+        throw std::runtime_error("Only canonical GFF3 JRL documents can be initialized.");
+    }
+    GffStruct* root = journal.root();
+    if (root == nullptr) {
+        throw std::runtime_error("The new JRL document does not contain a root structure.");
+    }
+    GffField* existing = root->GetFieldByLabel("Categories");
+    if (existing != nullptr) {
+        if (existing->fieldtype != FIELD_TYPE_LIST) {
+            throw std::runtime_error("The new JRL document has a Categories field with the wrong GFF type.");
+        }
+        if (static_cast<GffList&>(*existing).count() != 0) {
+            throw std::runtime_error("The JRL already contains quests and cannot be reinitialized.");
+        }
+    } else {
+        root->AddField(std::make_unique<GffList>("Categories"));
+    }
+    journal.dirty(true);
+}
+
+std::string suggestJournalQuestTag(const GffFile& journal) {
+    const GffList& categories = requireCategories(journal);
+    const auto tags = collectQuestTags(categories);
+    const std::string base = "new_quest";
+    if (tags.find(base) == tags.end()) return base;
+    for (std::uint64_t suffix = 2; suffix <= std::numeric_limits<UInt32>::max(); ++suffix) {
+        const std::string candidate = base + "_" + std::to_string(suffix);
+        if (tags.find(candidate) == tags.end()) return candidate;
+    }
+    throw std::runtime_error("Unable to generate a unique placeholder quest tag.");
+}
+
+JournalQuestInsertResult appendJournalQuest(
+    GffFile& journal,
+    JournalFlavor flavor,
+    std::optional<std::string> requestedTag,
+    const std::string& initialName) {
+    if (flavor != JournalFlavor::Kotor && flavor != JournalFlavor::NeverwinterNights) {
+        throw std::runtime_error("Choose either the KotOR or Neverwinter Nights journal schema before adding a quest.");
+    }
+
+    GffList& categories = requireCategories(journal);
+    std::string tag = requestedTag ? *requestedTag : suggestJournalQuestTag(journal);
+    tag = validateQuestTag(categories, std::move(tag));
+
+    const std::size_t newIndex = categories.count();
+    if (newIndex > static_cast<std::size_t>(std::numeric_limits<UInt32>::max())) {
+        throw std::runtime_error("The journal has too many quests for the GFF list format.");
+    }
+
+    const UInt32 structTypeId = nextStructTypeId(categories);
+    auto quest = std::make_unique<GffStruct>();
+    quest->typeid_ = structTypeId;
+
+    auto name = std::make_unique<GffLocalizedStringField>("Name", std::numeric_limits<UInt32>::max());
+    if (!initialName.empty()) name->SetStringByID(0, initialName);
+    quest->AddField(std::move(name));
+    quest->AddField(std::make_unique<GffExoStringField>("Tag", tag));
+    quest->AddField(std::make_unique<GffUInt32Field>("Priority", 0u));
+    quest->AddField(std::make_unique<GffWordField>("Picture", 0u));
+
+    if (flavor == JournalFlavor::Kotor) {
+        quest->AddField(std::make_unique<GffIntField>("PlotIndex", -1));
+        quest->AddField(std::make_unique<GffIntField>("PlanetID", -1));
+    } else {
+        quest->AddField(std::make_unique<GffExoStringField>("Comment", ""));
+        quest->AddField(std::make_unique<GffUInt32Field>("XP", 0u));
+    }
+
+    quest->AddField(std::make_unique<GffList>("EntryList"));
+    categories.AddStruct(std::move(quest));
+    journal.dirty(true);
+    return JournalQuestInsertResult{newIndex, structTypeId, tag, flavor};
+}
+
+std::optional<std::size_t> deleteJournalQuest(GffFile& journal,
+                                              std::size_t questIndex) {
+    GffList& categories = requireCategories(journal);
+    if (questIndex >= categories.count()) {
+        throw std::out_of_range("Quest index " + std::to_string(questIndex) +
+                                " is outside the Categories list.");
+    }
+    categories.DeleteStruct(static_cast<UInt32>(questIndex));
+    journal.dirty(true);
+    if (categories.count() == 0) return std::nullopt;
+    return std::min(questIndex, categories.count() - 1u);
+}
+
+void changeJournalQuestTag(GffFile& journal,
+                           std::size_t questIndex,
+                           const std::string& newTag) {
+    GffList& categories = requireCategories(journal);
+    if (questIndex >= categories.count()) {
+        throw std::out_of_range("Quest index " + std::to_string(questIndex) +
+                                " is outside the Categories list.");
+    }
+    GffStruct* quest = categories.GetStruct(questIndex);
+    if (quest == nullptr) throw std::runtime_error("The selected quest is missing its GFF struct.");
+
+    const std::string trimmed = trimAscii(newTag);
+    if (trimmed.empty()) throw std::runtime_error("A quest tag cannot be empty.");
+    const GffField* existingField = quest->GetFieldByLabel("Tag");
+    const std::string existing = existingField != nullptr && existingField->fieldtype == FIELD_TYPE_CEXOSTRING
+        ? trimAscii(static_cast<const GffExoStringField&>(*existingField).GetString())
+        : std::string();
+    const std::string tag = lowerAscii(existing) == lowerAscii(trimmed)
+        ? trimmed
+        : validateQuestTag(categories, trimmed, questIndex);
+    setJournalQuestString(journal, questIndex, "Tag", tag);
 }
 
 UInt32 suggestJournalEntryId(const GffFile& journal, std::size_t questIndex) {

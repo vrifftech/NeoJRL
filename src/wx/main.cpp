@@ -15,6 +15,7 @@
 
 #include <wx/aui/auibook.h>
 #include <wx/checkbox.h>
+#include <wx/choicdlg.h>
 #include <wx/config.h>
 #include <wx/clipbrd.h>
 #include <wx/choice.h>
@@ -98,7 +99,8 @@ std::string entryColumnLabel(std::size_t column) {
 }
 
 enum : int {
-    ID_Open = wxID_HIGHEST + 1,
+    ID_NewJournal = wxID_HIGHEST + 1,
+    ID_Open,
     ID_LoadTlk,
     ID_Save,
     ID_SaveAs,
@@ -117,6 +119,8 @@ enum : int {
     ID_ResetRowOrder,
     ID_ApplyQuest,
     ID_ApplyEntry,
+    ID_NewQuest,
+    ID_DeleteQuest,
     ID_NewEntry,
     ID_DeleteEntry,
     ID_CopyCells,
@@ -165,14 +169,20 @@ std::string normalizedJrlPatcherType(std::string type) {
 
 void requireJrlPatcherDocument(const GffFile& gff, const std::string& role) {
     if (!gff.loaded()) throw std::runtime_error(role + " is not loaded.");
-    if (gff.isGff4()) {
+    if (gff.isGff4() || normalizedJrlPatcherType(gff.version()) != "V3.2") {
         throw std::runtime_error(
-            role + " is GFF4. TSLPatcher/HoloPatcher [GFFList] journal output supports canonical GFF3 JRL files only.");
+            role + " is not a classic JRL V3.2 document supported by original TSLPatcher and HoloPatcher 1.7.");
     }
     if (normalizedJrlPatcherType(gff.filetype()) != "JRL") {
         throw std::runtime_error(role + " is not a JRL file.");
     }
     (void)requireCategories(gff);
+    const auto flavor = neojrl::detectJournalFlavor(gff);
+    if (flavor != neojrl::JournalFlavor::Kotor) {
+        throw std::runtime_error(
+            role + " uses the " + std::string(neojrl::journalFlavorDisplayName(flavor)) +
+            " journal schema. NeoJRL patcher export is limited to KotOR and KotOR II global.jrl files; distribute NWN/NWN2 journals as complete files.");
+    }
 }
 
 void requireMatchingJrlPatcherDocuments(const GffFile& original, const GffFile& modified) {
@@ -398,6 +408,7 @@ private:
         std::string tlkAutoLoadWarning;
         neoview::DocumentViewState viewState;
         neoview::DocumentViewState entryViewState;
+        JournalFlavor authoringFlavor = JournalFlavor::Unknown;
         std::string untitledName = "Untitled JRL";
         wxWindow* tabPage = nullptr;
     };
@@ -420,6 +431,8 @@ private:
     const neoview::DocumentViewState& viewState() const { return activeDocument().viewState; }
     neoview::DocumentViewState& entryViewState() { return activeDocument().entryViewState; }
     const neoview::DocumentViewState& entryViewState() const { return activeDocument().entryViewState; }
+    JournalFlavor& authoringFlavor() { return activeDocument().authoringFlavor; }
+    JournalFlavor authoringFlavor() const { return activeDocument().authoringFlavor; }
 
     bool tabDirty(const DocumentTab& tab) const { return tab.gff && tab.gff->dirty(); }
 
@@ -471,6 +484,73 @@ private:
     void ensureDocumentTabForOpen() {
         if (!hasActiveDocument()) { createDocumentTab(true); return; }
         if (!activeTabIsReusableForOpen()) createDocumentTab(true);
+    }
+
+    std::optional<JournalFlavor> promptJournalFlavor(const wxString& title,
+                                                       const wxString& message) {
+        wxArrayString choices;
+        choices.Add("KotOR / KotOR II");
+        choices.Add("Neverwinter Nights / NWN2");
+        wxSingleChoiceDialog dialog(this, message, title, choices);
+        if (dialog.ShowModal() != wxID_OK) return std::nullopt;
+        return dialog.GetSelection() == 1
+            ? JournalFlavor::NeverwinterNights
+            : JournalFlavor::Kotor;
+    }
+
+    std::optional<JournalFlavor> flavorForNewQuest() {
+        const JournalFlavor detected = detectJournalFlavor(gff());
+        if (detected == JournalFlavor::Kotor ||
+            detected == JournalFlavor::NeverwinterNights) {
+            return detected;
+        }
+        if (detected == JournalFlavor::Unknown &&
+            (authoringFlavor() == JournalFlavor::Kotor ||
+             authoringFlavor() == JournalFlavor::NeverwinterNights)) {
+            return authoringFlavor();
+        }
+        return promptJournalFlavor(
+            "New Quest",
+            detected == JournalFlavor::Mixed
+                ? "This journal contains more than one schema. Choose the schema for the new quest:"
+                : "Choose the game-family schema for the new quest:");
+    }
+
+    std::string defaultJournalFilename() const {
+        return authoringFlavor() == JournalFlavor::NeverwinterNights
+            ? "module.jrl"
+            : "global.jrl";
+    }
+
+    void onNewJournal(wxCommandEvent&) {
+        try {
+            const auto flavor = promptJournalFlavor(
+                "New Journal",
+                "Choose the game-family schema for this journal:");
+            if (!flavor) return;
+
+            ensureDocumentTabForOpen();
+            gff().NewFile("JRL ");
+            initializeJournal(gff());
+            authoringFlavor() = *flavor;
+            activeDocument().untitledName = *flavor == JournalFlavor::NeverwinterNights
+                ? "Untitled NWN Journal"
+                : "Untitled KotOR Journal";
+            viewState().resetForNewDocument();
+            entryViewState().resetForNewDocument();
+            if (searchText_ != nullptr) searchText_->ChangeValue("");
+            tryLoadCachedTlk();
+            refreshQuests();
+            updateActiveTabTitle();
+            wxui::setStatusText(
+                *this,
+                *flavor == JournalFlavor::NeverwinterNights
+                    ? "Created an empty NWN/NWN2 journal. Use New Quest to add its first quest."
+                    : "Created an empty KotOR/KotOR II journal. Use New Quest to add its first quest.",
+                1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
     }
 
     void selectDocumentTab(std::size_t index) {
@@ -569,6 +649,7 @@ private:
         if (path.empty()) return;
         ensureDocumentTabForOpen();
         gff().LoadFile(path);
+        authoringFlavor() = detectJournalFlavor(gff());
         viewState().resetForNewDocument();
         entryViewState().resetForNewDocument();
         if (searchText_) searchText_->ChangeValue("");
@@ -620,6 +701,7 @@ private:
 
     void buildMenus() {
         auto* file = new wxMenu;
+        file->Append(ID_NewJournal, "&New Journal...\tCtrl+N");
         file->Append(ID_Open, "&Open...\tCtrl+O");
         recentFilesMenu_ = new wxMenu;
         rebuildRecentFilesMenu();
@@ -657,8 +739,11 @@ private:
         edit->Append(ID_ApplyQuest, "Apply &Quest");
         edit->Append(ID_ApplyEntry, "Apply &Entry");
         edit->AppendSeparator();
-        edit->Append(ID_NewEntry, "&New Entry");
-        edit->Append(ID_DeleteEntry, "&Delete Entry");
+        edit->Append(ID_NewQuest, "&New Quest");
+        edit->Append(ID_DeleteQuest, "&Delete Quest");
+        edit->AppendSeparator();
+        edit->Append(ID_NewEntry, "New &Entry");
+        edit->Append(ID_DeleteEntry, "Delete E&ntry");
 
         auto* tools = new wxMenu;
         tools->Append(ID_ApplySearchFilter, "Apply Search as Quest &Filter");
@@ -711,6 +796,10 @@ private:
                                     wxLC_REPORT | wxLC_SINGLE_SEL | wxLC_HRULES | wxLC_VRULES);
         wxui::setColumns(*questList_, {{"#", 55}, {"Tag", 205}});
         leftSizer->Add(questList_, 1, wxEXPAND | wxALL, 4);
+        auto* questButtons = new wxBoxSizer(wxHORIZONTAL);
+        questButtons->Add(new wxButton(left, ID_NewQuest, "New Quest"), 0, wxRIGHT, FromDIP(4));
+        questButtons->Add(new wxButton(left, ID_DeleteQuest, "Delete Quest"), 0);
+        leftSizer->Add(questButtons, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
         left->SetSizer(leftSizer);
 
         auto* rightSizer = new wxBoxSizer(wxVERTICAL);
@@ -857,6 +946,7 @@ private:
     }
 
     void bindEvents() {
+        Bind(wxEVT_MENU, &NeoJRLFrame::onNewJournal, this, ID_NewJournal);
         Bind(wxEVT_MENU, &NeoJRLFrame::onOpen, this, ID_Open);
         Bind(wxEVT_MENU, &NeoJRLFrame::onOpenRecent, this, kRecentFileBaseId, kRecentFileBaseId + neosettings::kMaxRecentFiles - 1);
         Bind(wxEVT_MENU, &NeoJRLFrame::onClearRecentFiles, this, kClearRecentFilesId);
@@ -877,6 +967,8 @@ private:
         Bind(wxEVT_MENU, &NeoJRLFrame::onResetRowOrder, this, ID_ResetRowOrder);
         Bind(wxEVT_MENU, &NeoJRLFrame::onApplyQuest, this, ID_ApplyQuest);
         Bind(wxEVT_MENU, &NeoJRLFrame::onApplyEntry, this, ID_ApplyEntry);
+        Bind(wxEVT_MENU, &NeoJRLFrame::onNewQuest, this, ID_NewQuest);
+        Bind(wxEVT_MENU, &NeoJRLFrame::onDeleteQuest, this, ID_DeleteQuest);
         Bind(wxEVT_MENU, &NeoJRLFrame::onNewEntry, this, ID_NewEntry);
         Bind(wxEVT_MENU, &NeoJRLFrame::onDeleteEntry, this, ID_DeleteEntry);
         Bind(wxEVT_MENU, &NeoJRLFrame::onCopyCells, this, ID_CopyCells);
@@ -906,6 +998,8 @@ private:
         Bind(wxEVT_BUTTON, &NeoJRLFrame::dispatchButton, this, ID_Search);
         Bind(wxEVT_BUTTON, &NeoJRLFrame::dispatchButton, this, ID_ApplyQuest);
         Bind(wxEVT_BUTTON, &NeoJRLFrame::dispatchButton, this, ID_ApplyEntry);
+        Bind(wxEVT_BUTTON, &NeoJRLFrame::dispatchButton, this, ID_NewQuest);
+        Bind(wxEVT_BUTTON, &NeoJRLFrame::dispatchButton, this, ID_DeleteQuest);
         Bind(wxEVT_BUTTON, &NeoJRLFrame::dispatchButton, this, ID_NewEntry);
         Bind(wxEVT_BUTTON, &NeoJRLFrame::dispatchButton, this, ID_DeleteEntry);
         questList_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) { loadSelectedQuest(); });
@@ -927,7 +1021,10 @@ private:
 
     void updateHeaderPaths() {
         if (filePath_ != nullptr) {
-            const std::string path = gff().loaded() ? gff().filename().string() : std::string();
+            const std::string path = gff().loaded()
+                ? (gff().filename().empty() ? activeDocument().untitledName + " (unsaved)"
+                                            : gff().filename().string())
+                : std::string();
             if (wxui::toStd(filePath_->GetValue()) != path) filePath_->ChangeValue(wxui::toWx(path));
         }
         if (tlkPathText_ != nullptr) {
@@ -1060,7 +1157,12 @@ private:
         }
         neoview::setRowsFromLogicalRows(viewState(), visibleQuests);
         wxui::applyTheme(questList_, darkMode_);
-        std::string questStatus = "JRL: " + gff().filename().string() + "  Quests: " + std::to_string(visibleQuests.size()) + "/" + std::to_string(categories.count());
+        const std::string journalLabel = gff().filename().empty()
+            ? activeDocument().untitledName
+            : gff().filename().string();
+        std::string questStatus = "JRL: " + journalLabel + "  Quests: " +
+                                  std::to_string(visibleQuests.size()) + "/" +
+                                  std::to_string(categories.count());
         const std::string summary = neoview::columnFilterSummary(viewState());
         if (!viewState().filterTerm.empty()) {
             questStatus += "  Search filter: " + viewState().filterTerm;
@@ -1307,6 +1409,7 @@ private:
             } else {
                 throw std::runtime_error("NeoJRL imports only semantic XML or JSON. CSV/TSV flattened import is not supported for JRL/GFF files.");
             }
+            authoringFlavor() = detectJournalFlavor(gff());
             viewState().resetForNewDocument();
             entryViewState().resetForNewDocument();
             if (searchText_) searchText_->ChangeValue("");
@@ -1457,10 +1560,34 @@ private:
         }
     }
 
+    bool saveAsInteractive() {
+        const std::string defaultName = gff().filename().empty()
+            ? defaultJournalFilename()
+            : gff().filename().filename().string();
+        const auto file = wxui::chooseSaveFile(
+            this, "Save journal as", kJRLWildcard, defaultName);
+        if (!file) return false;
+
+        gff().SaveFile(*file);
+        const JournalFlavor detected = detectJournalFlavor(gff());
+        if (detected != JournalFlavor::Unknown) authoringFlavor() = detected;
+        updateActiveTabTitle();
+        rememberRecentFile(*file);
+        neogames::resolver().inferFromOpenedPath(*file);
+        refreshQuests();
+        return true;
+    }
+
     void onSave(wxCommandEvent&) {
         try {
             ensureLoaded();
+            if (gff().filename().empty()) {
+                (void)saveAsInteractive();
+                return;
+            }
             gff().SaveFile();
+            const JournalFlavor detected = detectJournalFlavor(gff());
+            if (detected != JournalFlavor::Unknown) authoringFlavor() = detected;
             updateActiveTabTitle();
             rememberRecentFile(gff().filename());
             neogames::resolver().inferFromOpenedPath(gff().filename());
@@ -1473,15 +1600,94 @@ private:
     void onSaveAs(wxCommandEvent&) {
         try {
             ensureLoaded();
-            const auto file = wxui::chooseSaveFile(this, "Save global.jrl as", kJRLWildcard, gff().filename().filename().string());
-            if (!file) {
-                return;
+            (void)saveAsInteractive();
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onNewQuest(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            const auto flavor = flavorForNewQuest();
+            if (!flavor) return;
+
+            const bool clearedQuestFilters = neoview::hasAnyFilter(viewState());
+            if (clearedQuestFilters) neoview::clearAllFilters(viewState());
+            neoview::clearAllFilters(entryViewState());
+
+            const auto added = appendJournalQuest(gff(), *flavor);
+            if (authoringFlavor() == JournalFlavor::Unknown) {
+                authoringFlavor() = *flavor;
             }
-            gff().SaveFile(*file);
-            updateActiveTabTitle();
-            rememberRecentFile(*file);
-            neogames::resolver().inferFromOpenedPath(*file);
+
             refreshQuests();
+            selectQuestIndex(added.index);
+            loadSelectedQuest();
+            updateActiveTabTitle();
+            if (tag_ != nullptr) {
+                tag_->SetFocus();
+                tag_->SelectAll();
+            }
+
+            std::string status = "Added " + std::string(journalFlavorDisplayName(*flavor)) +
+                                 " quest '" + added.tag + "'.";
+            if (clearedQuestFilters) {
+                status += " Quest filters were cleared so the new quest is visible.";
+            }
+            status += " Add its first journal entry when ready.";
+            wxui::setStatusText(*this, wxui::toWx(status), 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onDeleteQuest(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            const long row = wxui::selectedRow(*questList_);
+            if (row < 0) throw std::runtime_error("Select a quest to delete.");
+
+            const std::size_t questIndex = static_cast<std::size_t>(questList_->GetItemData(row));
+            const auto& categories = requireCategories(gff());
+            const GffStruct* quest = categories.GetStruct(questIndex);
+            if (quest == nullptr) throw std::runtime_error("The selected quest no longer exists.");
+
+            const std::string tag = fieldText(*quest, "Tag");
+            std::string name = locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr);
+            if (name.empty()) name = "(unnamed quest)";
+            const GffList* entries = questEntries(*quest);
+            const std::size_t entryCount = entries == nullptr ? 0 : entries->count();
+
+            std::string message = "Delete quest '" + name + "'";
+            if (!tag.empty()) message += " (tag: " + tag + ")";
+            message += " and all " + std::to_string(entryCount) +
+                       (entryCount == 1 ? " journal entry" : " journal entries") +
+                       "?\n\nThis changes the JRL structure and cannot be undone.";
+            if (!wxui::confirm(this, "Delete Quest", message)) return;
+
+            const JournalFlavor priorFlavor = detectJournalFlavor(gff());
+            const auto nextSelection = deleteJournalQuest(gff(), questIndex);
+            const JournalFlavor remainingFlavor = detectJournalFlavor(gff());
+            if (remainingFlavor == JournalFlavor::Kotor ||
+                remainingFlavor == JournalFlavor::NeverwinterNights) {
+                authoringFlavor() = remainingFlavor;
+            } else if (!nextSelection &&
+                       (priorFlavor == JournalFlavor::Kotor ||
+                        priorFlavor == JournalFlavor::NeverwinterNights)) {
+                authoringFlavor() = priorFlavor;
+            }
+
+            refreshQuests();
+            if (nextSelection) {
+                selectQuestIndex(*nextSelection);
+                loadSelectedQuest();
+            } else {
+                clearQuestPanel();
+                clearEntryPanel();
+            }
+            updateActiveTabTitle();
+            wxui::setStatusText(*this, "Quest deleted.", 1);
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
         }
@@ -1501,7 +1707,7 @@ private:
                 gff(), index, "Name", nameStrRef,
                 nameStrRef == kNoStrRef ? std::optional<std::string>{wxui::toStd(name_->GetValue())}
                                         : std::nullopt);
-            setJournalQuestString(gff(), index, "Tag", wxui::toStd(tag_->GetValue()));
+            changeJournalQuestTag(gff(), index, wxui::toStd(tag_->GetValue()));
             setJournalQuestOptionalString(gff(), index, "Comment", optionalText(*comment_));
             setJournalQuestOptionalDword(gff(), index, "Priority", parseOptionalDword(*priority_, "Sort priority"));
             setJournalQuestOptionalWord(gff(), index, "Picture", parseOptionalWord(*picture_, "Journal picture ID"));

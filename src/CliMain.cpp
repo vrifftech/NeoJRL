@@ -1,6 +1,7 @@
 #include "GFFFile.hpp"
 #include "GffTypeNames.hpp"
 #include "GffXml.hpp"
+#include "JrlEntryOperations.hpp"
 #include <neotlk/TlkLookup.hpp>
 #include "TabularData.hpp"
 #include "GffJson.hpp"
@@ -186,14 +187,20 @@ std::string normalizedJrlType(std::string type) {
 
 void requireJrlPatcherInput(const GffFile& gff, const std::string& role) {
     if (!gff.loaded()) throw std::runtime_error(role + " is not loaded.");
-    if (gff.isGff4()) {
+    if (gff.isGff4() || normalizedJrlType(gff.version()) != "V3.2") {
         throw std::runtime_error(
-            role + " is GFF4. TSLPatcher/HoloPatcher [GFFList] journal output supports canonical GFF3 JRL files only.");
+            role + " is not a classic JRL V3.2 document supported by original TSLPatcher and HoloPatcher 1.7.");
     }
     if (normalizedJrlType(gff.filetype()) != "JRL") {
         throw std::runtime_error(role + " is not a JRL file.");
     }
     (void)requireCategories(gff);
+    const auto flavor = neojrl::detectJournalFlavor(gff);
+    if (flavor != neojrl::JournalFlavor::Kotor) {
+        throw std::runtime_error(
+            role + " uses the " + std::string(neojrl::journalFlavorDisplayName(flavor)) +
+            " journal schema. NeoJRL patcher export is limited to KotOR and KotOR II global.jrl files; distribute NWN/NWN2 journals as complete files.");
+    }
 }
 
 void requireMatchingJrlPatchDocuments(const GffFile& original, const GffFile& modified) {

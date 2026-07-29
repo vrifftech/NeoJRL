@@ -16,6 +16,13 @@ enum class JournalFlavor {
     Mixed,
 };
 
+struct JournalQuestInsertResult {
+    std::size_t index = 0;
+    UInt32 structTypeId = 0;
+    std::string tag;
+    JournalFlavor flavor = JournalFlavor::Unknown;
+};
+
 struct JournalEntryInsertResult {
     std::size_t index = 0;
     UInt32 entryId = 0;
@@ -25,6 +32,31 @@ struct JournalEntryInsertResult {
 JournalFlavor detectJournalFlavor(const GffFile& journal);
 JournalFlavor detectJournalQuestFlavor(const GffFile& journal, std::size_t questIndex);
 const char* journalFlavorDisplayName(JournalFlavor flavor);
+
+// Initializes a new canonical JRL document with an empty Categories list.
+void initializeJournal(GffFile& journal);
+
+// Returns a case-insensitively unique placeholder tag for a new quest.
+std::string suggestJournalQuestTag(const GffFile& journal);
+
+// Appends a new quest/category using the selected game-family schema.
+JournalQuestInsertResult appendJournalQuest(
+    GffFile& journal,
+    JournalFlavor flavor,
+    std::optional<std::string> requestedTag = std::nullopt,
+    const std::string& initialName = "New Quest");
+
+// Removes one quest/category and returns the quest index that should be
+// selected afterwards, or std::nullopt when the journal becomes empty.
+std::optional<std::size_t> deleteJournalQuest(
+    GffFile& journal,
+    std::size_t questIndex);
+
+// Updates the script-facing quest tag while enforcing case-insensitive
+// uniqueness across the complete journal.
+void changeJournalQuestTag(GffFile& journal,
+                           std::size_t questIndex,
+                           const std::string& newTag);
 
 // Returns a quest-local entry ID that is not currently used. IDs are not
 // renumbered when entries are removed.
