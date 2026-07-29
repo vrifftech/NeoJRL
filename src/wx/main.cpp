@@ -727,8 +727,7 @@ private:
         wxui::createStatusBar(*this, 2);
         int widths[] = {-2, -3};
         SetStatusWidths(2, widths);
-        SetMinSize(FromDIP(wxSize(760, 480)));
-        SetInitialSize(FromDIP(wxSize(980, 640)));
+        wxui::configureResponsiveWindow(*this, wxSize(980, 640), wxSize(620, 400));
         settings_.restoreWindowPlacement(*this);
     }
 
