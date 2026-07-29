@@ -90,7 +90,7 @@ Entry ID 30
 
 A script can move directly from entry `0` to entry `20`. The list position of an entry is not its game-facing ID.
 
-The JRL defines the possible quest states and their text. The player's save game records which state has actually been reached; opening a normal JRL does not show one particular player's current progress.
+The JRL defines the possible quest states and their text. The player's save game records which state has actually been reached.
 
 ## Quests, categories, entries, and IDs
 
@@ -132,7 +132,7 @@ List position 2 -> Entry ID 100
 
 Deleting the middle entry does not renumber the others. Their IDs remain `10` and `100`.
 
-NeoJRL requires entry IDs to be unique within the selected quest. Duplicate IDs would make state lookup ambiguous.
+NeoJRL requires entry IDs to be unique within the selected quest.
 
 ## Example
 
@@ -528,8 +528,6 @@ Filtering does not delete or modify journal data.
 
 **File > Open Game Directory** shows the installations saved by NeoShared and opens NeoJRL's file chooser at the selected installation directory.
 
-This is only a navigation shortcut. It does not change the journal schema or rewrite the selected game installation.
-
 The installation registry is shared with the other Neo tools.
 
 ## Import, export, and patching
@@ -545,8 +543,6 @@ Use these formats for:
 - Scripted transformations.
 - Moving values between tools that understand the same hierarchy.
 
-NeoJRL intentionally does not expose CSV or TSV as full-file import/export formats. A flattened table cannot safely represent nested quest and entry structures.
-
 ### Clipboard copy and paste
 
 **Copy Selection** copies the selected quest and, when applicable, its selected entry as tab-separated field rows.
@@ -561,10 +557,6 @@ NeoJRL can compare an original JRL with the modified document and export either:
 
 - A complete patch package.
 - A patch fragment.
-
-The generator supports representable scalar and field changes. Generic list-structure additions and deletions may be reported as unsupported rather than emitted with unsafe fixed indexes.
-
-Always review generated patch instructions and test them against a clean copy of the target game files.
 
 
 ## Building NeoJRL
@@ -639,7 +631,7 @@ cmake --build build --parallel
 
 ## Raw field reference
 
-This section maps the editor's plain-language controls to the underlying GFF labels.
+This section maps the editor's controls to the underlying GFF labels.
 
 ### KotOR / KotOR II quest structure
 
