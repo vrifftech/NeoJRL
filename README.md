@@ -90,7 +90,7 @@ Entry ID 30
 
 A script can move directly from entry `0` to entry `20`. The list position of an entry is not its game-facing ID.
 
-The JRL defines the possible quest states and their text. The player's save game records which state has actually been reached; opening a normal JRL does not show one particular player's current progress.
+The JRL defines the possible quest states and their text. The player's save game records which state has actually been reached.
 
 ## Quests, categories, entries, and IDs
 
@@ -132,7 +132,7 @@ List position 2 -> Entry ID 100
 
 Deleting the middle entry does not renumber the others. Their IDs remain `10` and `100`.
 
-NeoJRL requires entry IDs to be unique within the selected quest. Duplicate IDs would make state lookup ambiguous.
+NeoJRL requires entry IDs to be unique within the selected quest.
 
 ## Example
 
