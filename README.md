@@ -22,7 +22,7 @@ Journal file
     `-- Entry 30: the quest is complete
 ```
 
-In KotOR and KotOR II, the file is normally named `global.jrl`. In Neverwinter Nights and Neverwinter Nights 2, it is commonly named `module.jrl`.
+In KotOR and KotOR II, the file is named `global.jrl`. In Neverwinter Nights and Neverwinter Nights 2, it is commonly named `module.jrl`.
 
 NeoJRL builds against the separate sibling [NeoShared](https://github.com/vrifftech/NeoShared) repository.
 
