@@ -109,6 +109,7 @@ struct PatchOutputOptions {
     bool allowUnsupported = false;
     std::string patchFilename;
     std::string modifiedFormat = "auto";
+    std::filesystem::path iniFilename = "changes.ini";
 };
 
 PatchOutputOptions parsePatchOutputOptions(int argc, char** argv, int begin, const std::filesystem::path& original) {
@@ -121,6 +122,9 @@ PatchOutputOptions parsePatchOutputOptions(int argc, char** argv, int begin, con
         else if (arg == "--filename") {
             if (i + 1 >= argc) throw std::runtime_error("--filename requires a value.");
             options.patchFilename = argv[++i];
+        } else if (arg == "--ini") {
+            if (i + 1 >= argc) throw std::runtime_error("--ini requires a filename.");
+            options.iniFilename = argv[++i];
         } else if (arg == "--allow-unsupported") options.allowUnsupported = true;
         else if (arg == "--modified-format" || arg == "--input-format") {
             if (i + 1 >= argc) throw std::runtime_error(arg + " requires a value.");
@@ -134,8 +138,14 @@ PatchOutputOptions parsePatchOutputOptions(int argc, char** argv, int begin, con
 void writePatchOutput(const neotsl::PatchProject& project, const std::filesystem::path& output, const PatchOutputOptions& options) {
     if (!options.allowUnsupported) neotsl::throwIfUnsupported(project);
     else neotsl::printReport(project);
-    if (options.package) neotsl::writePackage(project, output, true);
-    else neotsl::writeFragment(project, output);
+    if (options.package) {
+        const std::filesystem::path iniPath = options.iniFilename.is_absolute()
+            ? options.iniFilename
+            : output / options.iniFilename;
+        neotsl::writePackageToIni(project, iniPath, true);
+    } else {
+        neotsl::writeFragment(project, output);
+    }
 }
 
 std::string extensionImportFormat(const std::filesystem::path& path) {
@@ -362,8 +372,8 @@ void printUsage() {
               << "  neojrl-cli --search <global.jrl> <term>\n"
               << "  neojrl-cli --export <global.jrl> <xml|json> <output>\n"
               << "  neojrl-cli --import-values <input.jrl> <output.jrl> <xml|json> <input-document>\n"
-              << "  neojrl-cli --diff-tslpatcher <original.jrl> <modified-input> <output-dir|fragment.ini> [--modified-format xml|json|jrl|gff|kotor|native|auto] [--package|--fragment] [--filename name] [--allow-unsupported]\n"
-              << "  neojrl-cli --diff-tslpatcher-import <original.jrl> <modified-input> <xml|json|jrl|gff|kotor|native|auto> <output-dir|fragment.ini> [--package|--fragment] [--filename name] [--allow-unsupported]\n\n"
+              << "  neojrl-cli --diff-tslpatcher <original.jrl> <modified-input> <output-dir|fragment.ini> [--modified-format xml|json|jrl|gff|kotor|native|auto] [--package|--fragment] [--filename name] [--ini installer.ini] [--allow-unsupported]\n"
+              << "  neojrl-cli --diff-tslpatcher-import <original.jrl> <modified-input> <xml|json|jrl|gff|kotor|native|auto> <output-dir|fragment.ini> [--package|--fragment] [--filename name] [--ini installer.ini] [--allow-unsupported]\n\n"
               << "Prints, inspects, rewrites, searches, imports, or exports a canonical GFF V3.2 journal file.\n";
 }
 

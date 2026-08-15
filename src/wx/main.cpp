@@ -10,6 +10,7 @@
 #include "NeoGameDirectoryMenu.hpp"
 #include "NeoDocumentTabs.hpp"
 #include "NeoSettings.hpp"
+#include "NeoPatcherExport.hpp"
 #include "NeoViewState.hpp"
 #include "neojrl_icon.xpm"
 
@@ -43,6 +44,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+static_assert(wxui::kPatcherExportUiApiVersion >= 3u,
+              "NeoJRL requires the exact-INI/Fragment patch-export UI from the current neoshared checkout.");
 
 namespace {
 
@@ -129,8 +133,7 @@ enum : int {
     ID_ImportJson,
     ID_ExportXml,
     ID_ExportJson,
-    ID_ExportPatcherPackage,
-    ID_ExportPatcherFragment,
+    ID_ExportPatcher,
     ID_DarkMode,
     ID_FontIncrease,
     ID_FontDecrease,
@@ -729,8 +732,7 @@ private:
         exportMenu->Append(ID_ExportXml, "Export as &XML...");
         exportMenu->Append(ID_ExportJson, "Export as &JSON...");
         exportMenu->AppendSeparator();
-        exportMenu->Append(ID_ExportPatcherPackage, "Export TSL/HoloPatcher &Package...");
-        exportMenu->Append(ID_ExportPatcherFragment, "Export TSL/HoloPatcher &Fragment...");
+        exportMenu->Append(ID_ExportPatcher, "Export TSL/HoloPatcher Instructions...");
 
         auto* edit = new wxMenu;
         edit->Append(ID_CopyCells, "&Copy Selection	Ctrl-C");
@@ -977,8 +979,7 @@ private:
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { onImport(neotabular::Format::Json); }, ID_ImportJson);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { onExport(neotabular::Format::Xml); }, ID_ExportXml);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { onExport(neotabular::Format::Json); }, ID_ExportJson);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { onExportPatcher(true); }, ID_ExportPatcherPackage);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { onExportPatcher(false); }, ID_ExportPatcherFragment);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { onExportPatcher(); }, ID_ExportPatcher);
         Bind(wxEVT_MENU, &NeoJRLFrame::onToggleDarkMode, this, ID_DarkMode);
         Bind(wxEVT_MENU, &NeoJRLFrame::onIncreaseFontScale, this, ID_FontIncrease);
         Bind(wxEVT_MENU, &NeoJRLFrame::onDecreaseFontScale, this, ID_FontDecrease);
@@ -1437,7 +1438,7 @@ private:
         } catch (const std::exception& ex) { wxui::showError(this, ex); }
     }
 
-    void onExportPatcher(bool package) {
+    void onExportPatcher() {
         try {
             ensureLoaded();
             requireJrlPatcherDocument(gff(), "The active document");
@@ -1456,29 +1457,31 @@ private:
                                                     defaultPatchName);
             if (!patchName || patchName->empty()) return;
 
+            const auto output = wxui::choosePatcherOutput(this);
+            if (!output) return;
+            const bool writeToIni = output->writesToIni();
+
             auto project = neotsl::diffGffFlatTable(
-                jrlTableForPatcher(original), jrlTableForPatcher(gff()), *patchName, package, *originalPath);
+                jrlTableForPatcher(original), jrlTableForPatcher(gff()), *patchName, writeToIni, *originalPath);
             neotsl::throwIfUnsupported(project);
 
-            if (package) {
-                const auto outputDir = wxui::chooseDirectory(this, "Choose tslpatchdata package folder");
-                if (!outputDir) return;
-                neotsl::writePackage(project, *outputDir, true);
-                wxui::showMessage(this,
-                                  "TSL/HoloPatcher JRL Package",
-                                  "Wrote changes.ini and staged the clean JRL baseline in:\n" + outputDir->string());
-            } else {
-                const auto output = wxui::chooseSaveFile(
+            if (!writeToIni) {
+                wxui::showIniFragmentDialog(
                     this,
-                    "Save TSL/HoloPatcher JRL fragment",
-                    "INI files (*.ini)|*.ini|All files (*.*)|*.*",
-                    "jrl_fragment.ini");
-                if (!output) return;
-                neotsl::writeFragment(project, *output);
-                wxui::showMessage(this,
-                                  "TSL/HoloPatcher JRL Fragment",
-                                  "Wrote a GFFList fragment to:\n" + output->string());
+                    "JRL Patcher INI Fragment",
+                    project,
+                    {*patchName});
+                return;
             }
+
+            const auto report = neotsl::writePackageToIni(project, output->iniPath, true);
+            wxui::showMessage(
+                this,
+                "TSL/HoloPatcher JRL Package",
+                std::string(report.mergedExisting ? "Merged the generated JRL instructions into:\n"
+                                                  : "Created the installer INI:\n") +
+                    neosettings::pathToUtf8(report.iniPath) +
+                    "\n\nThe clean JRL baseline was staged beside the selected INI.");
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
         }
