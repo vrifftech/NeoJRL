@@ -5,6 +5,7 @@
 #include <neotlk/TlkLookup.hpp>
 #include "TabularData.hpp"
 #include "GffJson.hpp"
+#include "core/Version.hpp"
 #include "TslPatcher.hpp"
 
 #include <algorithm>
@@ -365,7 +366,7 @@ int roundTrip(const std::filesystem::path& input, const std::filesystem::path& o
 }
 
 void printUsage() {
-    std::cout << "Usage:\n"
+    std::cout << "NeoJRL " << kVersion << " journal editor CLI\n\nUsage:\n"
               << "  neojrl-cli <global.jrl> [dialog.tlk]\n"
               << "  neojrl-cli --info <global.jrl>\n"
               << "  neojrl-cli --roundtrip <global.jrl> <output.jrl>\n"
@@ -383,6 +384,10 @@ int main(int argc, char** argv) {
     try {
         if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h" || std::string(argv[1]) == "help")) {
             printUsage();
+            return 0;
+        }
+        if (argc >= 2 && (std::string(argv[1]) == "--version" || std::string(argv[1]) == "-v" || std::string(argv[1]) == "version")) {
+            std::cout << "NeoJRL " << kVersion << '\n';
             return 0;
         }
 

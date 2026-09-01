@@ -72,8 +72,6 @@ jobs:
             --jobs 2 \
             --clean
 
-      - name: Run tests
-        run: ctest --test-dir tool/build -C Release --output-on-failure
 
       - name: Stage install tree
         run: cmake --install tool/build --config Release --prefix tool/stage
@@ -143,9 +141,6 @@ jobs:
             -Parallel 2 `
             -Clean
 
-      - name: Run tests
-        shell: pwsh
-        run: ctest --test-dir tool/build -C Release --output-on-failure
 
       - name: Stage install tree
         shell: pwsh

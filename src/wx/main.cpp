@@ -6,6 +6,7 @@
 #include "TslPatcher.hpp"
 #include "AppModel.hpp"
 #include "GffJson.hpp"
+#include "core/Version.hpp"
 #include "wx_ui.hpp"
 #include "NeoGameDirectoryMenu.hpp"
 #include "NeoDocumentTabs.hpp"
@@ -37,6 +38,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -47,6 +49,10 @@
 
 static_assert(wxui::kPatcherExportUiApiVersion >= 3u,
               "NeoJRL requires the exact-INI/Fragment patch-export UI from the current neoshared checkout.");
+#if defined(__EMSCRIPTEN__)
+static_assert(neobrowser::kBrowserFileApiVersion >= 10u,
+              "NeoJRL requires owned browser imports and transactional write-back from the current neoshared checkout.");
+#endif
 
 namespace {
 
@@ -384,7 +390,7 @@ void writeTextFile(const std::filesystem::path& file, const std::string& text) {
 class NeoJRLFrame final : public wxFrame {
 public:
     NeoJRLFrame()
-        : wxFrame(nullptr, wxID_ANY, "NeoJRL v1.0.0 (JRL file editor)", wxDefaultPosition, wxDefaultSize) {
+        : wxFrame(nullptr, wxID_ANY, wxui::toWx(std::string("NeoJRL v") + kVersion + " (JRL file editor)"), wxDefaultPosition, wxDefaultSize) {
         setApplicationIcon();
         buildMenus();
         buildLayout();
@@ -399,13 +405,18 @@ public:
         refreshQuests();
         clearQuestPanel();
         clearEntryPanel();
-        wxui::setStatusText(*this, tlk().has_value() ? wxString("NeoJRL v1.0.0 ready. Open global.jrl.") : wxString("NeoJRL v1.0.0 ready. Open global.jrl; loading dialog.tlk is optional for resolved text."));
+        wxui::setStatusText(*this, wxui::toWx(
+            std::string("NeoJRL v") + kVersion +
+            (tlk().has_value()
+                 ? " ready. Open global.jrl."
+                 : " ready. Open global.jrl; loading dialog.tlk is optional for resolved text.")));
     }
 
 private:
 
     struct DocumentTab {
         std::unique_ptr<GffFile> gff = std::make_unique<GffFile>();
+        std::filesystem::path logicalFilename;
         std::optional<neotlk::TlkLookup> tlk;
         std::filesystem::path tlkPath;
         std::string tlkAutoLoadWarning;
@@ -414,6 +425,10 @@ private:
         JournalFlavor authoringFlavor = JournalFlavor::Unknown;
         std::string untitledName = "Untitled JRL";
         wxWindow* tabPage = nullptr;
+        bool saveInProgress = false;
+#if defined(__EMSCRIPTEN__)
+        neobrowser::BrowserImportLease sourceImport;
+#endif
     };
 
     bool hasActiveDocument() const {
@@ -437,15 +452,27 @@ private:
     JournalFlavor& authoringFlavor() { return activeDocument().authoringFlavor; }
     JournalFlavor authoringFlavor() const { return activeDocument().authoringFlavor; }
 
-    bool tabDirty(const DocumentTab& tab) const { return tab.gff && tab.gff->dirty(); }
+    std::filesystem::path documentFilename(const DocumentTab& tab) const {
+        if (!tab.logicalFilename.empty()) return tab.logicalFilename;
+        return tab.gff ? tab.gff->filename() : std::filesystem::path{};
+    }
+
+    bool tabDirty(const DocumentTab& tab) const {
+        return tab.saveInProgress || (tab.gff && tab.gff->dirty());
+    }
 
     std::string tabDisplayName(const DocumentTab& tab) const {
-        return neotabs::displayNameForPath(tab.gff ? tab.gff->filename() : std::filesystem::path{}, tab.untitledName);
+        return neotabs::displayNameForPath(documentFilename(tab), tab.untitledName);
+    }
+
+    void updateDocumentTabTitle(DocumentTab& document) {
+        neotabs::setTabLabel(documentTabs_, document.tabPage,
+                             tabDisplayName(document), tabDirty(document));
     }
 
     void updateActiveTabTitle() {
         if (!hasActiveDocument()) return;
-        neotabs::setTabLabel(documentTabs_, activeDocument().tabPage, tabDisplayName(activeDocument()), tabDirty(activeDocument()));
+        updateDocumentTabTitle(activeDocument());
     }
 
     void createDocumentTab(bool select = true) {
@@ -488,6 +515,37 @@ private:
         if (!hasActiveDocument()) { createDocumentTab(true); return; }
         if (!activeTabIsReusableForOpen()) createDocumentTab(true);
     }
+
+#if defined(__EMSCRIPTEN__)
+    using BrowserImportCallback = std::function<void(neobrowser::BrowserImportLease)>;
+
+    void requestBrowserImport(const std::string& title,
+                              const std::string& accept,
+                              bool multiple,
+                              BrowserImportCallback callback) {
+        wxWeakRef<NeoJRLFrame> weakSelf(this);
+        neobrowser::requestOpenFilesOwned(
+            title, accept, multiple,
+            [weakSelf, callback = std::move(callback)](
+                neobrowser::OwnedOpenFilesResult result) mutable {
+                if (!weakSelf || weakSelf->IsBeingDeleted()) return;
+                auto* const frame = weakSelf.get();
+                if (!result.error.empty()) {
+                    wxMessageBox(wxui::toWx(result.error), "File Open Error",
+                                 wxOK | wxICON_ERROR, frame);
+                    return;
+                }
+                if (result.cancelled()) return;
+                callback(std::move(result.import));
+            });
+    }
+
+    static bool importOwnsPath(const neobrowser::BrowserImportLease& import,
+                               const std::filesystem::path& path) {
+        return std::find(import.paths().begin(), import.paths().end(), path) !=
+               import.paths().end();
+    }
+#endif
 
     std::optional<JournalFlavor> promptJournalFlavor(const wxString& title,
                                                        const wxString& message) {
@@ -535,6 +593,10 @@ private:
             ensureDocumentTabForOpen();
             gff().NewFile("JRL ");
             initializeJournal(gff());
+            activeDocument().logicalFilename.clear();
+#if defined(__EMSCRIPTEN__)
+            activeDocument().sourceImport.reset();
+#endif
             authoringFlavor() = *flavor;
             activeDocument().untitledName = *flavor == JournalFlavor::NeverwinterNights
                 ? "Untitled NWN Journal"
@@ -570,6 +632,11 @@ private:
 
     bool confirmCloseDocumentTab(std::size_t index) {
         if (index >= documents_.size()) return true;
+        if (documents_[index].saveInProgress) {
+            wxui::showMessage(this, "Save in progress",
+                              "Finish the browser save transaction before closing this tab.");
+            return false;
+        }
         if (!tabDirty(documents_[index])) return true;
         return wxui::confirm(this, "Close tab", neotabs::closePromptText(tabDisplayName(documents_[index])));
     }
@@ -652,6 +719,10 @@ private:
         if (path.empty()) return;
         ensureDocumentTabForOpen();
         gff().LoadFile(path);
+        activeDocument().logicalFilename = path;
+#if defined(__EMSCRIPTEN__)
+        activeDocument().sourceImport.reset();
+#endif
         authoringFlavor() = detectJournalFlavor(gff());
         viewState().resetForNewDocument();
         entryViewState().resetForNewDocument();
@@ -661,6 +732,14 @@ private:
         neogames::resolver().inferFromOpenedPath(path);
         refreshQuests();
     }
+
+#if defined(__EMSCRIPTEN__)
+    void openJrlPath(const std::filesystem::path& path,
+                     neobrowser::BrowserImportLease import) {
+        openJrlPath(path);
+        activeDocument().sourceImport = std::move(import);
+    }
+#endif
 
     void onOpenRecent(wxCommandEvent& event) {
         const int index = event.GetId() - kRecentFileBaseId;
@@ -986,7 +1065,7 @@ private:
         Bind(wxEVT_MENU, &NeoJRLFrame::onResetFontScale, this, ID_FontReset);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_EXIT);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) {
-            wxui::showMessage(this, "About NeoJRL", "NeoJRL v1.0.0\nNative wxWidgets journal editor\n\nA special thanks to everyone in the KOTOR modding community that has contributed their work, knowledge, and creativity to making tools, mods, and guides over the last 20+ years");
+            wxui::showMessage(this, "About NeoJRL", std::string("NeoJRL v") + kVersion + "\nNative wxWidgets journal editor\n\nA special thanks to everyone in the KOTOR modding community that has contributed their work, knowledge, and creativity to making tools, mods, and guides over the last 20+ years");
         }, wxID_ABOUT);
         documentTabs_->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, &NeoJRLFrame::onDocumentTabChanged, this);
         documentTabs_->Bind(wxEVT_AUINOTEBOOK_PAGE_CLOSE, &NeoJRLFrame::onDocumentTabCloseRequested, this);
@@ -1022,9 +1101,10 @@ private:
 
     void updateHeaderPaths() {
         if (filePath_ != nullptr) {
+            const std::filesystem::path filename = documentFilename(activeDocument());
             const std::string path = gff().loaded()
-                ? (gff().filename().empty() ? activeDocument().untitledName + " (unsaved)"
-                                            : gff().filename().string())
+                ? (filename.empty() ? activeDocument().untitledName + " (unsaved)"
+                                    : filename.string())
                 : std::string();
             if (wxui::toStd(filePath_->GetValue()) != path) filePath_->ChangeValue(wxui::toWx(path));
         }
@@ -1158,9 +1238,10 @@ private:
         }
         neoview::setRowsFromLogicalRows(viewState(), visibleQuests);
         wxui::applyTheme(questList_, darkMode_);
-        const std::string journalLabel = gff().filename().empty()
+        const std::filesystem::path filename = documentFilename(activeDocument());
+        const std::string journalLabel = filename.empty()
             ? activeDocument().untitledName
-            : gff().filename().string();
+            : filename.string();
         std::string questStatus = "JRL: " + journalLabel + "  Quests: " +
                                   std::to_string(visibleQuests.size()) + "/" +
                                   std::to_string(categories.count());
@@ -1398,15 +1479,13 @@ private:
         }
     }
 
-    void onImport(neotabular::Format format) {
+    void importFromPath(neotabular::Format format, const std::filesystem::path& file) {
         try {
             ensureLoaded();
-            const auto file = wxui::chooseOpenFile(this, "Import " + neotabular::formatName(format), tableWildcardForFormat(format));
-            if (!file) return;
             if (format == neotabular::Format::Xml) {
-                LoadGffXml(gff(), readTextFile(*file));
+                LoadGffXml(gff(), readTextFile(file));
             } else if (format == neotabular::Format::Json) {
-                LoadGffXml(gff(), gffJsonToXml(readTextFile(*file)));
+                LoadGffXml(gff(), gffJsonToXml(readTextFile(file)));
             } else {
                 throw std::runtime_error("NeoJRL imports only semantic XML or JSON. CSV/TSV flattened import is not supported for JRL/GFF files.");
             }
@@ -1415,15 +1494,50 @@ private:
             entryViewState().resetForNewDocument();
             if (searchText_) searchText_->ChangeValue("");
             refreshQuests();
-            wxui::setStatusText(*this, wxui::toWx("Imported " + file->string()), 1);
-        } catch (const std::exception& ex) { wxui::showError(this, ex); }
+            wxui::setStatusText(*this, wxui::toWx("Imported " + file.string()), 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onImport(neotabular::Format format) {
+#if defined(__EMSCRIPTEN__)
+        if (!hasActiveDocument()) return;
+        wxWindow* const targetPage = activeDocument().tabPage;
+        requestBrowserImport(
+            "Import " + neotabular::formatName(format),
+            format == neotabular::Format::Xml ? ".xml" : ".json",
+            false,
+            [this, targetPage, format](neobrowser::BrowserImportLease import) {
+                if (import.empty() || IsBeingDeleted()) return;
+                if (!hasActiveDocument() || activeDocument().tabPage != targetPage) {
+                    wxui::showMessage(
+                        this,
+                        "Import Cancelled",
+                        "The active document changed while the import picker was open. Start the import again from the intended tab.");
+                    return;
+                }
+                importFromPath(format, import.paths().front());
+            });
+#else
+        try {
+            const auto file = wxui::chooseOpenFile(
+                this,
+                "Import " + neotabular::formatName(format),
+                tableWildcardForFormat(format));
+            if (!file) return;
+            importFromPath(format, *file);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+#endif
     }
 
     void onExport(neotabular::Format format) {
         try {
             ensureLoaded();
             const auto file = wxui::chooseSaveFile(this, "Export " + neotabular::formatName(format), tableWildcardForFormat(format),
-                                                  exportDefaultFilename(gff().filename(), format, "global"));
+                                                  exportDefaultFilename(documentFilename(activeDocument()), format, "global"));
             if (!file) return;
             if (format == neotabular::Format::Xml || format == neotabular::Format::Json) {
                 if (neoview::hasAnyFilter(viewState()) || neoview::hasAnyFilter(entryViewState())) {
@@ -1438,23 +1552,22 @@ private:
         } catch (const std::exception& ex) { wxui::showError(this, ex); }
     }
 
-    void onExportPatcher() {
+    void exportPatcherFromOriginal(const std::filesystem::path& originalPath) {
         try {
             ensureLoaded();
             requireJrlPatcherDocument(gff(), "The active document");
-            const auto originalPath = wxui::chooseOpenFile(this, "Select clean/unmodified global.jrl", kJRLWildcard);
-            if (!originalPath) return;
 
             GffFile original;
-            original.LoadFile(*originalPath);
+            original.LoadFile(originalPath);
             requireMatchingJrlPatcherDocuments(original, gff());
 
-            std::string defaultPatchName = gff().filename().filename().string();
+            std::string defaultPatchName = documentFilename(activeDocument()).filename().string();
             if (defaultPatchName.empty()) defaultPatchName = "global.jrl";
-            const auto patchName = wxui::promptText(this,
-                                                    "Patch Target Filename",
-                                                    "JRL filename to patch in the user's install:",
-                                                    defaultPatchName);
+            const auto patchName = wxui::promptText(
+                this,
+                "Patch Target Filename",
+                "JRL filename to patch in the user's install:",
+                defaultPatchName);
             if (!patchName || patchName->empty()) return;
 
             const auto output = wxui::choosePatcherOutput(this);
@@ -1462,7 +1575,11 @@ private:
             const bool writeToIni = output->writesToIni();
 
             auto project = neotsl::diffGffFlatTable(
-                jrlTableForPatcher(original), jrlTableForPatcher(gff()), *patchName, writeToIni, *originalPath);
+                jrlTableForPatcher(original),
+                jrlTableForPatcher(gff()),
+                *patchName,
+                writeToIni,
+                originalPath);
             neotsl::throwIfUnsupported(project);
 
             if (!writeToIni) {
@@ -1482,6 +1599,40 @@ private:
                                                   : "Created the installer INI:\n") +
                     neosettings::pathToUtf8(report.iniPath) +
                     "\n\nThe clean JRL baseline was staged beside the selected INI.");
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onExportPatcher() {
+        try {
+            ensureLoaded();
+            requireJrlPatcherDocument(gff(), "The active document");
+#if defined(__EMSCRIPTEN__)
+            wxWindow* const targetPage = activeDocument().tabPage;
+            requestBrowserImport(
+                "Select clean/unmodified global.jrl",
+                ".jrl",
+                false,
+                [this, targetPage](neobrowser::BrowserImportLease import) {
+                    if (import.empty() || IsBeingDeleted()) return;
+                    if (!hasActiveDocument() || activeDocument().tabPage != targetPage) {
+                        wxui::showMessage(
+                            this,
+                            "Patcher Export Cancelled",
+                            "The active document changed while the baseline picker was open. Start the export again from the intended tab.");
+                        return;
+                    }
+                    exportPatcherFromOriginal(import.paths().front());
+                });
+#else
+            const auto originalPath = wxui::chooseOpenFile(
+                this,
+                "Select clean/unmodified global.jrl",
+                kJRLWildcard);
+            if (!originalPath) return;
+            exportPatcherFromOriginal(*originalPath);
+#endif
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
         }
@@ -1512,16 +1663,34 @@ private:
     }
 
     void chooseAndOpenJrl(const std::filesystem::path& initialDirectory = {}) {
+#if defined(__EMSCRIPTEN__)
+        (void)initialDirectory;
+        requestBrowserImport(
+            "Please select a global.jrl file to open.",
+            ".jrl",
+            false,
+            [this](neobrowser::BrowserImportLease import) {
+                if (import.empty() || IsBeingDeleted()) return;
+                try {
+                    const std::filesystem::path selected = import.paths().front();
+                    openJrlPath(selected, std::move(import));
+                } catch (const std::exception& ex) {
+                    wxui::showError(this, ex);
+                }
+            });
+#else
         try {
             const auto file = wxui::chooseOpenFile(
-                this, "Please select a global.jrl file to open.", kJRLWildcard, initialDirectory);
-            if (!file) {
-                return;
-            }
+                this,
+                "Please select a global.jrl file to open.",
+                kJRLWildcard,
+                initialDirectory);
+            if (!file) return;
             openJrlPath(*file);
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
         }
+#endif
     }
 
     void onOpen(wxCommandEvent&) {
@@ -1530,6 +1699,12 @@ private:
 
     void tryLoadCachedTlk() {
         if (tlk().has_value()) return;
+#if defined(__EMSCRIPTEN__)
+        // Browser imports are process-local and cannot be reopened after a
+        // page reload. Discard any stale cached virtual path.
+        neosettings::AppSettings(kAppName).clearLastTlkPath();
+        return;
+#else
         const auto cached = readCachedTlkPath();
         if (!cached || cached->empty()) return;
         try {
@@ -1544,18 +1719,16 @@ private:
         } catch (const std::exception& ex) {
             tlkAutoLoadWarning() = std::string("Unable to auto-load cached TLK: ") + ex.what();
         }
+#endif
     }
 
-    void onLoadTlk(wxCommandEvent&) {
+    void loadTlkFromPath(const std::filesystem::path& file, bool rememberPath = true) {
         try {
-            const auto file = wxui::chooseOpenFile(this, "Load dialog.tlk for optional resolved text", kTlkWildcard);
-            if (!file) {
-                return;
-            }
             tlk().emplace();
-            tlk()->load(*file);
-            tlkPath() = *file;
-            writeCachedTlkPath(*file);
+            tlk()->load(file);
+            tlkPath() = file;
+            if (rememberPath) writeCachedTlkPath(file);
+            else neosettings::AppSettings(kAppName).clearLastTlkPath();
             tlkAutoLoadWarning().clear();
             refreshQuests();
         } catch (const std::exception& ex) {
@@ -1563,38 +1736,150 @@ private:
         }
     }
 
-    bool saveAsInteractive() {
-        const std::string defaultName = gff().filename().empty()
-            ? defaultJournalFilename()
-            : gff().filename().filename().string();
-        const auto file = wxui::chooseSaveFile(
-            this, "Save journal as", kJRLWildcard, defaultName);
-        if (!file) return false;
+    void onLoadTlk(wxCommandEvent&) {
+#if defined(__EMSCRIPTEN__)
+        if (!hasActiveDocument()) return;
+        wxWindow* const targetPage = activeDocument().tabPage;
+        requestBrowserImport(
+            "Load dialog.tlk for optional resolved text",
+            ".tlk",
+            false,
+            [this, targetPage](neobrowser::BrowserImportLease import) {
+                if (import.empty() || IsBeingDeleted()) return;
+                if (!hasActiveDocument() || activeDocument().tabPage != targetPage) {
+                    wxui::showMessage(
+                        this,
+                        "TLK Load Cancelled",
+                        "The active document changed while the TLK picker was open. Select the TLK again from the intended tab.");
+                    return;
+                }
+                // TlkLookup owns all decoded data after load; release this
+                // one-shot import when the callback returns.
+                loadTlkFromPath(import.paths().front(), false);
+            });
+#else
+        const auto file = wxui::chooseOpenFile(
+            this,
+            "Load dialog.tlk for optional resolved text",
+            kTlkWildcard);
+        if (!file) return;
+        loadTlkFromPath(*file);
+#endif
+    }
 
-        gff().SaveFile(*file);
-        const JournalFlavor detected = detectJournalFlavor(gff());
-        if (detected != JournalFlavor::Unknown) authoringFlavor() = detected;
-        updateActiveTabTitle();
-        rememberRecentFile(*file);
-        neogames::resolver().inferFromOpenedPath(*file);
+    bool saveTo(const std::filesystem::path& target) {
+        if (target.empty() || !hasActiveDocument() || !gff().loaded()) return false;
+        if (activeDocument().saveInProgress || browserSaveActive_) return false;
+
+        DocumentTab& document = activeDocument();
+        const bool wasDirty = document.gff->dirty();
+        document.gff->SaveFile(target);
+
+#if defined(__EMSCRIPTEN__)
+        document.saveInProgress = true;
+        browserSaveActive_ = true;
+        updateDocumentTabTitle(document);
+        refreshQuests();
+        Enable(false);
+
+        wxWeakRef<NeoJRLFrame> weakSelf(this);
+        wxWindow* const targetPage = document.tabPage;
+        neobrowser::requestDownloadFile(
+            target,
+            target.filename().string(),
+            [weakSelf, targetPage, target, wasDirty](neobrowser::DownloadResult result) {
+                if (!weakSelf || weakSelf->IsBeingDeleted()) return;
+                auto* const frame = weakSelf.get();
+                frame->browserSaveActive_ = false;
+                frame->Enable(true);
+
+                const std::size_t index = neotabs::findDocumentIndexForPage(
+                    frame->documents_, targetPage);
+                if (index == neotabs::npos) return;
+
+                DocumentTab& savedDocument = frame->documents_[index];
+                savedDocument.saveInProgress = false;
+                if (!result.error.empty() || result.cancelled()) {
+                    savedDocument.gff->dirty(wasDirty);
+                    frame->updateDocumentTabTitle(savedDocument);
+                    if (index == frame->activeDocumentIndex_) frame->refreshQuests();
+                    const std::string message = result.error.empty()
+                        ? "The browser save transaction was cancelled."
+                        : result.error;
+                    wxMessageBox(wxui::toWx(message), "Save Failed",
+                                 wxOK | wxICON_ERROR, frame);
+                    return;
+                }
+
+                if (result.ready()) {
+                    savedDocument.gff->dirty(wasDirty);
+                    frame->updateDocumentTabTitle(savedDocument);
+                    if (index == frame->activeDocumentIndex_) frame->refreshQuests();
+                    wxui::showMessage(
+                        frame,
+                        "Replacement download ready",
+                        "The browser could not overwrite the original host file directly. "
+                        "A replacement JRL is ready in the download panel. The tab remains marked modified. "
+                        "Download the replacement, then close the tab only after confirming that you retained it.");
+                    return;
+                }
+
+                if (!result.saved()) {
+                    savedDocument.gff->dirty(wasDirty);
+                    frame->updateDocumentTabTitle(savedDocument);
+                    if (index == frame->activeDocumentIndex_) frame->refreshQuests();
+                    wxMessageBox(
+                        "The browser did not confirm that the JRL was written.",
+                        "Save Failed", wxOK | wxICON_ERROR, frame);
+                    return;
+                }
+
+                savedDocument.logicalFilename = target;
+                savedDocument.gff->dirty(false);
+                const JournalFlavor detected = detectJournalFlavor(*savedDocument.gff);
+                if (detected != JournalFlavor::Unknown) {
+                    savedDocument.authoringFlavor = detected;
+                }
+                if (!frame->importOwnsPath(savedDocument.sourceImport, target)) {
+                    savedDocument.sourceImport.reset();
+                }
+                frame->rememberRecentFile(target);
+                neogames::resolver().inferFromOpenedPath(target);
+                frame->updateDocumentTabTitle(savedDocument);
+                if (index == frame->activeDocumentIndex_) frame->refreshQuests();
+            });
+        return true;
+#else
+        document.logicalFilename = target;
+        document.gff->dirty(false);
+        const JournalFlavor detected = detectJournalFlavor(*document.gff);
+        if (detected != JournalFlavor::Unknown) document.authoringFlavor = detected;
+        rememberRecentFile(target);
+        neogames::resolver().inferFromOpenedPath(target);
         refreshQuests();
         return true;
+#endif
+    }
+
+    bool saveAsInteractive() {
+        const std::filesystem::path current = documentFilename(activeDocument());
+        const std::string defaultName = current.empty()
+            ? defaultJournalFilename()
+            : current.filename().string();
+        const auto file = wxui::chooseSaveFile(
+            this, "Save journal as", kJRLWildcard, defaultName);
+        return file && saveTo(*file);
     }
 
     void onSave(wxCommandEvent&) {
         try {
             ensureLoaded();
-            if (gff().filename().empty()) {
+            const std::filesystem::path target = documentFilename(activeDocument());
+            if (target.empty()) {
                 (void)saveAsInteractive();
                 return;
             }
-            gff().SaveFile();
-            const JournalFlavor detected = detectJournalFlavor(gff());
-            if (detected != JournalFlavor::Unknown) authoringFlavor() = detected;
-            updateActiveTabTitle();
-            rememberRecentFile(gff().filename());
-            neogames::resolver().inferFromOpenedPath(gff().filename());
-            refreshQuests();
+            (void)saveTo(target);
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
         }
@@ -2079,6 +2364,12 @@ private:
     }
 
     void onClose(wxCloseEvent& event) {
+        if (browserSaveActive_ && event.CanVeto()) {
+            wxui::showMessage(this, "Save in progress",
+                              "Finish the browser save transaction before closing NeoJRL.");
+            event.Veto();
+            return;
+        }
         if (event.CanVeto() && !confirmCloseAllTabs()) {
             event.Veto();
             return;
@@ -2122,6 +2413,7 @@ private:
     bool tabSwitchInProgress_ = false;
     int contextVisualColumn_ = 0;
     bool contextListIsEntry_ = false;
+    bool browserSaveActive_ = false;
     neoview::FontScaleWheelFilter fontScaleWheelFilter_;
     double fontScale_ = neoview::kDefaultFontScale;
     bool darkMode_ = false;

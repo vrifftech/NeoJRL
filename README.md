@@ -9,7 +9,9 @@ NeoJRL is a purpose-built editor for BioWare journal files (`.jrl`). It supports
 - Neverwinter Nights
 - Neverwinter Nights 2
 
-NeoJRL presents a journal as quests and journal states instead of requiring you to edit the underlying GFF structure by hand.
+NeoJRL presents a journal as quests and journal states instead of requiring you to edit the underlying GFF structure by hand. It can create new journal files, add or remove complete quests, and add or remove the individual journal states within each quest.
+
+> Jade Empire uses the different QST quest format. Use **NeoQST** for `.qst` and `.qst2` files.
 
 The simplest way to think about a JRL is:
 
@@ -21,9 +23,6 @@ Journal file
     |-- Entry 20: the objective changes
     `-- Entry 30: the quest is complete
 ```
-
-In KotOR and KotOR II, the file is named `global.jrl`. In Neverwinter Nights and Neverwinter Nights 2, it is commonly named `module.jrl`.
-
 NeoJRL builds against the separate sibling [NeoShared](https://github.com/vrifftech/NeoShared) repository.
 
 ## Contents
@@ -36,14 +35,17 @@ NeoJRL builds against the separate sibling [NeoShared](https://github.com/vrifft
 - [Neverwinter Nights and NWN2 fields](#neverwinter-nights-and-nwn2-fields)
 - [Using the editor](#using-the-editor)
 - [TLK files, StrRefs, and embedded text](#tlk-files-strrefs-and-embedded-text)
-- [Adding and deleting entries](#adding-and-deleting-entries)
+- [Creating journals, quests, and entries](#creating-journals-quests-and-entries)
 - [Search and filtering](#search-and-filtering)
 - [Shared game directories](#shared-game-directories)
 - [Import, export, and patching](#import-export-and-patching)
+- [Command-line utility](#command-line-utility)
 - [Building NeoJRL](#building-neojrl)
 - [Raw field reference](#raw-field-reference)
 
 ## Quick start
+
+To edit an existing journal:
 
 1. Open `global.jrl` or `module.jrl`.
 2. Optionally load the game's `dialog.tlk` so NeoJRL can show the text behind each StrRef.
@@ -53,9 +55,19 @@ NeoJRL builds against the separate sibling [NeoShared](https://github.com/vrifft
 6. Edit its ID, text, completion flag, or XP value and click **Apply Entry**.
 7. Save the JRL.
 
+To author a new quest:
+
+1. Open the game's existing JRL, or choose **File > New Journal** to start a new one.
+2. Click **New Quest**.
+3. Replace the generated `new_quest` tag with a unique script-facing tag.
+4. Enter the quest title and other quest settings, then click **Apply Quest**.
+5. Click **New Entry** to add the first journal state.
+6. Edit the state and click **Apply Entry**.
+7. Save the JRL.
+
 If the JRL is stored inside a `.mod`, `.erf`, `.rim`, `.hak`, or another game archive, extract it with NeoERF first and put the edited file back into the archive afterward.
 
-Make a backup before structural changes. Deleting an entry is immediate within the open document and NeoJRL does not currently provide an undo command.
+Make a backup before structural changes. Deleting a quest or entry is immediate within the open document and NeoJRL does not currently provide an undo command.
 
 ## How a journal works
 
@@ -90,7 +102,7 @@ Entry ID 30
 
 A script can move directly from entry `0` to entry `20`. The list position of an entry is not its game-facing ID.
 
-The JRL defines the possible quest states and their text. The player's save game records which state has actually been reached.
+The JRL defines the possible quest states and their text. The player's save game records which state has actually been reached; opening a normal JRL does not show one particular player's current progress.
 
 ## Quests, categories, entries, and IDs
 
@@ -132,9 +144,9 @@ List position 2 -> Entry ID 100
 
 Deleting the middle entry does not renumber the others. Their IDs remain `10` and `100`.
 
-NeoJRL requires entry IDs to be unique within the selected quest.
+NeoJRL requires entry IDs to be unique within the selected quest. Duplicate IDs would make state lookup ambiguous.
 
-## Example
+## Worked KotOR example
 
 Suppose a quest tracks a stolen artifact.
 
@@ -354,7 +366,9 @@ An asterisk in a tab title indicates unsaved changes.
 
 #### JRL file
 
-Shows the path of the active journal. Use **Open**, **Save**, or **Save As** to manage the file.
+Shows the path of the active journal. Use **New Journal**, **Open**, **Save**, or **Save As** to manage the file.
+
+A new KotOR/KotOR II journal defaults to `global.jrl`. A new Neverwinter Nights/NWN2 journal defaults to `module.jrl` when first saved.
 
 #### dialog.tlk
 
@@ -386,6 +400,8 @@ The left-hand list shows the quests/categories in the active JRL.
 The first column is the physical list position. The second is the quest tag.
 
 Selecting a quest loads its fields and its entry list on the right.
+
+Use **New Quest** to append a new quest/category and **Delete Quest** to remove the selected quest together with all of its journal entries.
 
 ### Quest panel
 
@@ -454,11 +470,56 @@ Without a TLK, NeoJRL can still:
 - Open and save JRL files.
 - Edit StrRef numbers.
 - Edit embedded text.
-- Add and delete entries.
+- Create and delete quests and entries.
 
 The TLK is only needed for resolved previews and text-based searching of TLK-backed strings.
 
-## Adding and deleting entries
+## Creating journals, quests, and entries
+
+### New Journal
+
+Choose **File > New Journal** when you need a new standalone JRL instead of editing an existing one.
+
+NeoJRL asks which game-family schema to use:
+
+```text
+KotOR / KotOR II
+Neverwinter Nights / NWN2
+```
+
+That choice controls which fields NeoJRL creates for new quests and entries. It does not add a game name or profile marker to the JRL itself; the underlying format is still `JRL V3.2`.
+
+The new journal starts empty. Click **New Quest** to add its first quest. The first save uses the usual filename for the selected family:
+
+```text
+KotOR / KotOR II          global.jrl
+Neverwinter Nights / NWN2 module.jrl
+```
+
+### New Quest
+
+**New Quest** appends a blank quest/category using the journal's detected schema.
+
+For a normal existing journal, NeoJRL detects the schema from the quests already present. For an empty or mixed-schema journal, it asks which schema the new quest should use.
+
+A new quest receives:
+
+- A unique placeholder tag such as `new_quest` or `new_quest_2`.
+- An embedded title of `New Quest` with no TLK StrRef.
+- Neutral/default numeric values.
+- An empty entry list.
+
+Replace the placeholder tag and title, set the remaining quest fields, and click **Apply Quest**. Quest tags are case-insensitive in the games, so NeoJRL does not allow two quests whose tags differ only by capitalization.
+
+The new quest does not receive a journal entry automatically. Click **New Entry** when you are ready to author its first state.
+
+### Delete Quest
+
+**Delete Quest** removes the selected quest/category and every journal entry inside it.
+
+Scripts normally identify a quest by its tag, not by the quest's physical position in the JRL. Deleting a quest therefore does not renumber any separate quest ID, but any scripts that still refer to the deleted tag will no longer find that quest.
+
+Deletion cannot currently be undone. NeoJRL shows the quest name, tag, and entry count before asking for confirmation.
 
 ### New Entry
 
@@ -493,12 +554,6 @@ NeoJRL does not renumber the remaining entry IDs. Scripts that refer to those ID
 
 Deletion cannot currently be undone. Save a backup or use version control before restructuring a journal.
 
-### Creating or deleting entire quests
-
-The current semantic interface edits existing quests and manages their entries. It does not yet provide **New Quest** or **Delete Quest** commands.
-
-For structural category-level work, use NeoGFF or a reviewed XML/JSON workflow, then reopen the result in NeoJRL for semantic editing.
-
 ## Search and filtering
 
 NeoJRL provides two related tools.
@@ -528,6 +583,8 @@ Filtering does not delete or modify journal data.
 
 **File > Open Game Directory** shows the installations saved by NeoShared and opens NeoJRL's file chooser at the selected installation directory.
 
+This is only a navigation shortcut. It does not change the journal schema or rewrite the selected game installation.
+
 The installation registry is shared with the other Neo tools.
 
 ## Import, export, and patching
@@ -543,6 +600,8 @@ Use these formats for:
 - Scripted transformations.
 - Moving values between tools that understand the same hierarchy.
 
+NeoJRL intentionally does not expose CSV or TSV as full-file import/export formats. A flattened table cannot safely represent nested quest and entry structures.
+
 ### Clipboard copy and paste
 
 **Copy Selection** copies the selected quest and, when applicable, its selected entry as tab-separated field rows.
@@ -553,10 +612,18 @@ This is an advanced operation. Review pasted indexes and fields carefully, espec
 
 ### TSLPatcher and HoloPatcher output
 
-NeoJRL can compare an original JRL with the modified document and export either:
+NeoJRL compares an original JRL with the modified document and then offers two output choices:
 
-- A complete patch package.
-- A patch fragment.
+- **Write to INI** selects or creates an installer INI and merges the journal instructions into it without replacing unrelated content.
+- **Fragment** opens a read-only preview and lets you copy the generated INI sections to the clipboard or save that exact text as a new INI file. It never merges into an existing INI and does not stage the clean baseline JRL.
+
+Separate install options may use names such as `install_full.ini` and `install_lite.ini`. The CLI retains file-based package/fragment output and the `--ini install_full.ini` option.
+
+When required, NeoJRL allocates unused `FileN` and `AddFieldN` keys, renames colliding generated helper sections, and remaps `2DAMEMORY#` and `StrRef#` tokens. An identical baseline JRL already beside the INI is retained; a different file with the same payload name is rejected rather than overwritten.
+
+The generator supports representable scalar and field changes. Generic list-structure additions and deletions may be reported as unsupported rather than emitted with unsafe fixed indexes.
+
+Always review generated patch instructions and test them against a clean copy of the target game files.
 
 
 ## Building NeoJRL
@@ -583,15 +650,6 @@ bash ./scripts/build.sh \
   --jobs "$(nproc)" \
   --clean
 ```
-
-### Linux CLI/core-only build
-
-```sh
-bash ./scripts/build.sh \
-  --neoshared-root ../neoshared \
-  --wx OFF \
-  --jobs "$(nproc)" \
-  --clean
 ```
 
 ### Windows GUI build
@@ -631,7 +689,7 @@ cmake --build build --parallel
 
 ## Raw field reference
 
-This section maps the editor's controls to the underlying GFF labels.
+This section maps the editor's plain-language controls to the underlying GFF labels.
 
 ### KotOR / KotOR II quest structure
 
