@@ -7,31 +7,7 @@ if(NOT NEO_HOSTED_BUILD)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "MSVC runtime library")
 endif()
 
-set(NEOSHARED_ROOT "" CACHE PATH
-    "Path to the neoshared source repository; defaults to ../neoshared")
-
-if(NOT NEOSHARED_ROOT AND DEFINED ENV{NEOSHARED_ROOT}
-   AND NOT "$ENV{NEOSHARED_ROOT}" STREQUAL "")
-    set(NEOSHARED_ROOT "$ENV{NEOSHARED_ROOT}" CACHE PATH
-        "Path to the neoshared source repository" FORCE)
-endif()
-
-if(NOT NEOSHARED_ROOT)
-    get_filename_component(NEOSHARED_ROOT
-        "${CMAKE_CURRENT_LIST_DIR}/../neoshared" ABSOLUTE)
-else()
-    get_filename_component(NEOSHARED_ROOT "${NEOSHARED_ROOT}" ABSOLUTE
-        BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
-endif()
-set(NEOSHARED_ROOT "${NEOSHARED_ROOT}" CACHE PATH
-    "Path to the neoshared source repository" FORCE)
-
-if(NOT EXISTS "${NEOSHARED_ROOT}/CMakeLists.txt")
-    message(FATAL_ERROR
-        "neoshared was not found at '${NEOSHARED_ROOT}'. "
-        "Clone the neoshared repository beside this repository, or configure "
-        "with -DNEOSHARED_ROOT=/path/to/neoshared.")
-endif()
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/NeoSharedSource.cmake")
 
 include("${NEOSHARED_ROOT}/cmake/NeoVersion.cmake")
 include("${NEOSHARED_ROOT}/cmake/NeoMacOSBundle.cmake")
@@ -204,7 +180,7 @@ if(NEOJRL_BUILD_WX_GUI OR NEOJRL_BUILD_WX_MODULE)
             SLUG "neojrl"
             ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/neojrl.svg"
         )
-        target_link_libraries(NeoJRL PRIVATE neojrl_core neoshared::gff_app)
+        target_link_libraries(NeoJRL PRIVATE neojrl_wx)
         target_include_directories(NeoJRL PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/resources)
         target_link_libraries(NeoJRL PRIVATE neoshared::wx)
         neojrl_link_wx(NeoJRL)
