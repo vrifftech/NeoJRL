@@ -1,6 +1,6 @@
 #pragma once
 
-#define NEOJRL_VERSION_STRING "1.1.0"
+#define NEOJRL_VERSION_STRING "1.1.1"
 
 namespace neojrl {
 

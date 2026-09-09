@@ -3,7 +3,9 @@ cmake_minimum_required(VERSION 3.16)
 if(POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 endif()
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "MSVC runtime library" FORCE)
+if(NOT NEO_HOSTED_BUILD)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "MSVC runtime library")
+endif()
 
 set(NEOSHARED_ROOT "" CACHE PATH
     "Path to the neoshared source repository; defaults to ../neoshared")
@@ -39,7 +41,7 @@ neo_read_version_header(NEOJRL_VERSION
     NEOJRL_VERSION_STRING)
 project(NeoJRLCpp VERSION ${NEOJRL_VERSION} LANGUAGES CXX)
 
-if(MSVC)
+if(MSVC AND NOT NEO_HOSTED_BUILD)
     foreach(_neo_runtime_flag_var IN ITEMS
         CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE CMAKE_C_FLAGS_RELWITHDEBINFO CMAKE_C_FLAGS_MINSIZEREL
         CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_MINSIZEREL)
@@ -55,7 +57,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 function(neo_force_static_msvc_runtime target_name)
-    if(MSVC AND TARGET ${target_name})
+    if(MSVC AND NOT NEO_HOSTED_BUILD AND TARGET ${target_name})
         set_property(TARGET ${target_name} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
         target_compile_options(${target_name} PRIVATE
             $<$<CONFIG:Debug>:/MTd>
@@ -65,7 +67,7 @@ function(neo_force_static_msvc_runtime target_name)
 endfunction()
 
 function(neo_force_static_msvc_runtime_for_directory_targets)
-    if(MSVC)
+    if(MSVC AND NOT NEO_HOSTED_BUILD)
         get_property(_neo_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
         foreach(_neo_target IN LISTS _neo_targets)
             get_target_property(_neo_type ${_neo_target} TYPE)
@@ -91,11 +93,14 @@ add_library(neojrl_core
     src/JrlEntryOperations.cpp
 )
 target_include_directories(neojrl_core PUBLIC src)
-target_link_libraries(neojrl_core PUBLIC neoshared::gff neoshared::tlk neoshared::tslpatcher)
+target_link_libraries(neojrl_core PUBLIC neoshared::gff_app neoshared::tlk neoshared::tslpatcher)
 target_compile_features(neojrl_core PUBLIC cxx_std_17)
 
-add_executable(neojrl-cli src/CliMain.cpp)
-target_link_libraries(neojrl-cli PRIVATE neojrl_core)
+option(NEOJRL_BUILD_CLI "Build the NeoJRL CLI" ON)
+if(NEOJRL_BUILD_CLI)
+    add_executable(neojrl-cli src/CliMain.cpp)
+    target_link_libraries(neojrl-cli PRIVATE neojrl_core)
+endif()
 
 
 option(NEOJRL_BUILD_WX_GUI "Build the wxWidgets desktop GUI when wxWidgets is available" ON)
@@ -103,7 +108,7 @@ option(NEOJRL_REQUIRE_WX_GUI "Fail configure if wxWidgets is unavailable while N
 
 
 function(neojrl_link_wx target_name)
-    target_compile_definitions(${target_name} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(${target_name} PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 
     set(_wx_targets)
     foreach(_wx_target IN ITEMS wx::core wx::base wx::adv wx::aui wxWidgets::wxWidgets)
@@ -113,21 +118,23 @@ function(neojrl_link_wx target_name)
     endforeach()
 
     if(_wx_targets)
-        target_link_libraries(${target_name} PRIVATE ${_wx_targets})
+        target_link_libraries(${target_name} PUBLIC ${_wx_targets})
     else()
         if(wxWidgets_USE_FILE)
             include(${wxWidgets_USE_FILE})
         endif()
-        target_include_directories(${target_name} SYSTEM PRIVATE ${wxWidgets_INCLUDE_DIRS})
-        target_compile_definitions(${target_name} PRIVATE ${wxWidgets_DEFINITIONS})
-        target_link_libraries(${target_name} PRIVATE ${wxWidgets_LIBRARIES})
+        target_include_directories(${target_name} SYSTEM PUBLIC ${wxWidgets_INCLUDE_DIRS})
+        target_compile_definitions(${target_name} PUBLIC ${wxWidgets_DEFINITIONS})
+        target_link_libraries(${target_name} PUBLIC ${wxWidgets_LIBRARIES})
     endif()
 
     neo_force_static_msvc_runtime(${target_name})
 endfunction()
 
 
-if(NEOJRL_BUILD_WX_GUI)
+option(NEOJRL_BUILD_WX_MODULE "Build reusable editor panel" OFF)
+
+if(NEOJRL_BUILD_WX_GUI OR NEOJRL_BUILD_WX_MODULE)
     set(NEOJRL_WX_COMPONENTS core base adv aui)
     # vcpkg provides CMake package targets such as wx::core and wx::base.
     # Prefer CONFIG mode on Windows/vcpkg, but keep FindwxWidgets/wx-config as
@@ -156,6 +163,20 @@ if(NEOJRL_BUILD_WX_GUI)
     endif()
 
     if(wxWidgets_FOUND OR TARGET wx::core OR TARGET wxWidgets::wxWidgets)
+        if(NOT EXISTS "${NEOSHARED_ROOT}/include/neoshared/GffResourceDocument.hpp")
+            message(FATAL_ERROR "Update NeoShared: hosted GFF resource API required")
+        endif()
+        add_library(neojrl_wx STATIC src/wx/EditorPanel.cpp)
+        add_library(neojrl::wx ALIAS neojrl_wx)
+        target_include_directories(neojrl_wx PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(neojrl_wx PUBLIC neojrl_core neoshared::wx)
+        neojrl_link_wx(neojrl_wx)
+        if(MSVC)
+            target_compile_options(neojrl_wx PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(neojrl_wx PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        if(NEOJRL_BUILD_WX_GUI)
         set(NEOJRL_WX_SOURCES src/wx/main.cpp)
         if(WIN32)
             neo_configure_windows_version_resource(
@@ -210,6 +231,7 @@ if(NEOJRL_BUILD_WX_GUI)
                 DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications
             )
         endif()
+        endif() # standalone wrapper
     elseif(NEOJRL_REQUIRE_WX_GUI)
         message(FATAL_ERROR "wxWidgets was not found, but NEOJRL_REQUIRE_WX_GUI is ON. On Windows, install the pinned wxWidgets 3.3.3 overlay with ../neoshared/scripts/install-wxwidgets.ps1 and configure with the vcpkg toolchain. On Debian or Ubuntu, install libwxgtk3.2-dev.")
     else()
@@ -221,4 +243,6 @@ endif()
 neo_force_static_msvc_runtime_for_directory_targets()
 neo_apply_minimal_release_to_directory_targets()
 
-install(TARGETS neojrl-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(TARGET neojrl-cli)
+    install(TARGETS neojrl-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()

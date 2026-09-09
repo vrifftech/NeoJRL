@@ -1,0 +1,2504 @@
+#include "JRLEditorPanel.hpp"
+#include <neoshared/GffResourceDocument.hpp>
+#include "GFFFile.hpp"
+#include "GffXml.hpp"
+#include "JrlEntryOperations.hpp"
+#include <neotlk/TlkLookup.hpp>
+#include "TabularData.hpp"
+#include "TslPatcher.hpp"
+#include "AppModel.hpp"
+#include "GffJson.hpp"
+#include "core/Version.hpp"
+#include "wx_ui.hpp"
+#include "NeoGameDirectoryMenu.hpp"
+#include "NeoDocumentTabs.hpp"
+#include "NeoSettings.hpp"
+#include "NeoPatcherExport.hpp"
+#include "NeoViewState.hpp"
+
+
+#include <wx/aui/auibook.h>
+#include <wx/checkbox.h>
+#include <wx/choicdlg.h>
+#include <wx/config.h>
+#include <wx/clipbrd.h>
+#include <wx/choice.h>
+#include <wx/icon.h>
+#include <wx/iconbndl.h>
+#include <wx/listctrl.h>
+#include <wx/sizer.h>
+#include <wx/splitter.h>
+#include <wx/statbox.h>
+#include <wx/wx.h>
+#include <wx/version.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+static_assert(wxui::kPatcherExportUiApiVersion >= 3u,
+              "NeoJRL requires the exact-INI/Fragment patch-export UI from the current neoshared checkout.");
+#if defined(__EMSCRIPTEN__)
+static_assert(neobrowser::kBrowserFileApiVersion >= 10u,
+              "NeoJRL requires owned browser imports and transactional write-back from the current neoshared checkout.");
+#endif
+
+namespace {
+
+using namespace neojrl;
+
+constexpr const char* kAppName = "NeoJRL";
+constexpr const char* kJRLWildcard = "Journal files (*.jrl)|*.jrl|All files (*.*)|*.*";
+constexpr const char* kTlkWildcard = "TLK files (*.tlk)|*.tlk|All files (*.*)|*.*";
+constexpr const char* kXmlTableWildcard = "XML files (*.xml)|*.xml|All files (*.*)|*.*";
+constexpr const char* kJsonTableWildcard = "JSON files (*.json)|*.json|All files (*.*)|*.*";
+
+const char* tableWildcardForFormat(neotabular::Format format) {
+    switch (format) {
+    case neotabular::Format::Xml: return kXmlTableWildcard;
+    case neotabular::Format::Json: return kJsonTableWildcard;
+    default: throw std::invalid_argument("NeoJRL supports semantic XML and JSON table import/export only.");
+    }
+}
+
+std::string exportExtensionForFormat(neotabular::Format format) {
+    switch (format) {
+    case neotabular::Format::Csv: return "csv";
+    case neotabular::Format::Tsv: return "tsv";
+    case neotabular::Format::Xml: return "xml";
+    case neotabular::Format::Json: return "json";
+    }
+    return "txt";
+}
+
+std::string exportDefaultFilename(const std::filesystem::path& source,
+                                  neotabular::Format format,
+                                  const std::string& fallbackStem) {
+    std::string stem = source.empty() ? fallbackStem : source.stem().string();
+    if (stem.empty()) stem = fallbackStem.empty() ? std::string("export") : fallbackStem;
+    return stem + "." + exportExtensionForFormat(format);
+}
+
+constexpr std::uint32_t kNoStrRef = 0xFFFFFFFFu;
+
+std::string questColumnLabel(std::size_t column) {
+    switch (column) {
+        case 0: return "#";
+        case 1: return "Tag";
+        default: return "Column " + std::to_string(column);
+    }
+}
+
+std::string entryColumnLabel(std::size_t column) {
+    switch (column) {
+        case 0: return "#";
+        case 1: return "ID";
+        default: return "Column " + std::to_string(column);
+    }
+}
+
+enum : int {
+    ID_NewJournal = wxID_HIGHEST + 14000,
+    ID_Open,
+    ID_LoadTlk,
+    ID_Save,
+    ID_SaveAs,
+    ID_CloseTab,
+    ID_CloseOtherTabs,
+    ID_NextTab,
+    ID_PreviousTab,
+    ID_DocumentTabs,
+    ID_Search,
+    ID_ApplySearchFilter,
+    ID_ClearFilter,
+    ID_FilterColumn,
+    ID_ClearColumnFilter,
+    ID_ClearAllFilters,
+    ID_ResetColumnOrder,
+    ID_ResetRowOrder,
+    ID_ApplyQuest,
+    ID_ApplyEntry,
+    ID_NewQuest,
+    ID_DeleteQuest,
+    ID_NewEntry,
+    ID_DeleteEntry,
+    ID_CopyCells,
+    ID_PasteCells,
+    ID_ImportXml,
+    ID_ImportJson,
+    ID_ExportXml,
+    ID_ExportJson,
+    ID_ExportPatcher,
+    ID_DarkMode,
+    ID_FontIncrease,
+    ID_FontDecrease,
+    ID_FontReset,
+};
+
+constexpr int ID_ModuleExit = wxID_HIGHEST + 14450;
+constexpr int ID_ModuleAbout = wxID_HIGHEST + 14451;
+constexpr int kRecentFileBaseId = wxID_HIGHEST + 14500;
+constexpr int kClearRecentFilesId = kRecentFileBaseId + neosettings::kMaxRecentFiles;
+
+const GffField* field(const GffStruct& structure, const std::string& label) {
+    return structure.GetFieldByLabel(label);
+}
+
+std::string fieldText(const GffStruct& structure, const std::string& label) {
+    const GffField* f = field(structure, label);
+    return f ? f->GetString() : std::string();
+}
+
+const GffList& requireCategories(const GffFile& gff) {
+    const GffField* categoriesField = gff.GetFieldByLabel("Categories");
+    if (categoriesField == nullptr || categoriesField->fieldtype != FIELD_TYPE_LIST) {
+        throw std::runtime_error("The selected file is not a valid canonical global.jrl file.");
+    }
+    return static_cast<const GffList&>(*categoriesField);
+}
+
+std::string normalizedJrlPatcherType(std::string type) {
+    type.erase(std::remove_if(type.begin(), type.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }), type.end());
+    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
+    return type;
+}
+
+void requireJrlPatcherDocument(const GffFile& gff, const std::string& role) {
+    if (!gff.loaded()) throw std::runtime_error(role + " is not loaded.");
+    if (gff.isGff4() || normalizedJrlPatcherType(gff.version()) != "V3.2") {
+        throw std::runtime_error(
+            role + " is not a classic JRL V3.2 document supported by original TSLPatcher and HoloPatcher 1.7.");
+    }
+    if (normalizedJrlPatcherType(gff.filetype()) != "JRL") {
+        throw std::runtime_error(role + " is not a JRL file.");
+    }
+    (void)requireCategories(gff);
+    const auto flavor = neojrl::detectJournalFlavor(gff);
+    if (flavor != neojrl::JournalFlavor::Kotor) {
+        throw std::runtime_error(
+            role + " uses the " + std::string(neojrl::journalFlavorDisplayName(flavor)) +
+            " journal schema. NeoJRL patcher export is limited to KotOR and KotOR II global.jrl files; distribute NWN/NWN2 journals as complete files.");
+    }
+}
+
+void requireMatchingJrlPatcherDocuments(const GffFile& original, const GffFile& modified) {
+    requireJrlPatcherDocument(original, "The original patch baseline");
+    requireJrlPatcherDocument(modified, "The modified patch document");
+    if (original.version() != modified.version()) {
+        throw std::runtime_error("The original and modified JRL versions do not match.");
+    }
+}
+
+neotabular::Table jrlTableForPatcher(const GffFile& gff) {
+    neogff::GffModel model;
+    model.importXml(ToGffXml(gff));
+    return model.toTable();
+}
+
+const GffList* questEntries(const GffStruct& quest) {
+    const GffField* listField = quest.GetFieldByLabel("EntryList");
+    if (listField == nullptr || listField->fieldtype != FIELD_TYPE_LIST) {
+        return nullptr;
+    }
+    return &static_cast<const GffList&>(*listField);
+}
+
+std::string locStringText(const GffLocalizedStringField& loc, const neotlk::TlkLookup* tlk) {
+    if (loc.strref == kNoStrRef) {
+        return loc.GetStringById(0);
+    }
+    if (tlk == nullptr) {
+        return "Bad StrRef";
+    }
+    const auto resolved = tlk->resolve(loc.strref);
+    return resolved.value_or(std::string("Bad StrRef"));
+}
+
+std::string locStrRefText(const GffStruct& structure, const std::string& label) {
+    const GffField* f = field(structure, label);
+    if (f != nullptr && f->fieldtype == FIELD_TYPE_CEXOLOCSTRING) {
+        const auto& loc = static_cast<const GffLocalizedStringField&>(*f);
+        return loc.strref == kNoStrRef ? std::string("-1") : std::to_string(loc.strref);
+    }
+    return std::string();
+}
+
+std::string locResolvedText(const GffStruct& structure, const std::string& label, const neotlk::TlkLookup* tlk) {
+    const GffField* f = field(structure, label);
+    if (f != nullptr && f->fieldtype == FIELD_TYPE_CEXOLOCSTRING) {
+        return locStringText(static_cast<const GffLocalizedStringField&>(*f), tlk);
+    }
+    return std::string();
+}
+
+std::string pathForQuest(std::size_t questIndex, const std::string& fieldName) {
+    return "Categories\\" + std::to_string(questIndex) + "\\" + fieldName;
+}
+
+std::string pathForStage(std::size_t questIndex, std::size_t stageIndex, const std::string& fieldName) {
+    return "Categories\\" + std::to_string(questIndex) + "\\EntryList\\" + std::to_string(stageIndex) + "\\" + fieldName;
+}
+
+std::string lowerAscii(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return text;
+}
+
+bool containsInsensitive(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    return lowerAscii(haystack).find(lowerAscii(needle)) != std::string::npos;
+}
+
+std::string trimAscii(std::string text) {
+    const auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    });
+    const auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }).base();
+    return first < last ? std::string(first, last) : std::string{};
+}
+
+std::optional<std::int32_t> parseOptionalInt32(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text.empty()) return std::nullopt;
+    std::size_t consumed = 0;
+    const long long value = std::stoll(text, &consumed, 10);
+    if (consumed != text.size() || value < std::numeric_limits<std::int32_t>::min() ||
+        value > std::numeric_limits<std::int32_t>::max()) {
+        throw std::runtime_error(std::string(label) + " must be a signed 32-bit integer.");
+    }
+    return static_cast<std::int32_t>(value);
+}
+
+std::optional<UInt32> parseOptionalDword(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text.empty()) return std::nullopt;
+    std::size_t consumed = 0;
+    const unsigned long long value = std::stoull(text, &consumed, 10);
+    if (consumed != text.size() || value > std::numeric_limits<UInt32>::max()) {
+        throw std::runtime_error(std::string(label) + " must be an unsigned 32-bit integer.");
+    }
+    return static_cast<UInt32>(value);
+}
+
+UInt32 parseRequiredDword(const wxTextCtrl& control, const char* label) {
+    const auto value = parseOptionalDword(control, label);
+    if (!value) throw std::runtime_error(std::string(label) + " is required.");
+    return *value;
+}
+
+UInt32 parseRequiredStrRef(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text == "-1") return kNoStrRef;
+    if (text.empty()) throw std::runtime_error(std::string(label) + " is required and must be -1 or an unsigned 32-bit value.");
+    std::size_t consumed = 0;
+    const unsigned long long value = std::stoull(text, &consumed, 10);
+    if (consumed != text.size() || value > std::numeric_limits<UInt32>::max()) {
+        throw std::runtime_error(std::string(label) + " must be -1 or an unsigned 32-bit value.");
+    }
+    return static_cast<UInt32>(value);
+}
+
+std::optional<std::string> optionalText(const wxTextCtrl& control) {
+    const std::string value = wxui::toStd(control.GetValue());
+    return trimAscii(value).empty() ? std::nullopt : std::optional<std::string>{value};
+}
+
+std::optional<std::uint16_t> parseOptionalWord(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text.empty()) return std::nullopt;
+    std::size_t consumed = 0;
+    const unsigned long long value = std::stoull(text, &consumed, 10);
+    if (consumed != text.size() || value > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::runtime_error(std::string(label) + " must be between 0 and 65535.");
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
+std::optional<float> parseOptionalFloat(const wxTextCtrl& control, const char* label) {
+    const std::string text = trimAscii(wxui::toStd(control.GetValue()));
+    if (text.empty()) return std::nullopt;
+    std::size_t consumed = 0;
+    const float value = std::stof(text, &consumed);
+    if (consumed != text.size() || !std::isfinite(value)) {
+        throw std::runtime_error(std::string(label) + " must be a finite decimal number.");
+    }
+    if (value < 0.0f) {
+        throw std::runtime_error(std::string(label) + " cannot be negative.");
+    }
+    return value;
+}
+
+
+std::size_t optionalColumn(const neotabular::Table& table, const std::string& name) {
+    const std::string want = lowerAscii(name);
+    for (std::size_t i = 0; i < table.columns.size(); ++i) {
+        if (lowerAscii(table.columns[i]) == want) return i;
+    }
+    return table.columns.size();
+}
+
+std::size_t requireColumn(const neotabular::Table& table, const std::string& name) {
+    const auto index = optionalColumn(table, name);
+    if (index == table.columns.size()) throw std::runtime_error("Imported table is missing required column: " + name);
+    return index;
+}
+
+std::string tableCell(const std::vector<std::string>& row, std::size_t index) {
+    return index < row.size() ? row[index] : std::string();
+}
+
+std::optional<std::filesystem::path> readCachedTlkPath() {
+    return neosettings::AppSettings(kAppName).lastTlkPath();
+}
+
+void writeCachedTlkPath(const std::filesystem::path& path) {
+    neosettings::AppSettings(kAppName).setLastTlkPath(path);
+}
+
+std::string readTextFile(const std::filesystem::path& file) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) throw std::runtime_error("Unable to open input text file: " + file.string());
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+void writeTextFile(const std::filesystem::path& file, const std::string& text) {
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("Unable to open output text file: " + file.string());
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!out) throw std::runtime_error("Unable to write output text file: " + file.string());
+}
+
+class NeoJRLPanelImpl final : public neojrl::ui::JRLEditorPanel {
+public:
+    NeoJRLPanelImpl(wxWindow* parent, neomodules::Context context)
+        : JRLEditorPanel(parent, std::move(context)) {
+        buildMenus();
+        buildLayout();
+        darkMode_ = wxui::readDarkMode(kAppName);
+        fontScale_ = settings_.fontScale();
+        if (!context_.embedded) fontScaleWheelFilter_.attach(this, [this](int steps) { changeFontScaleSteps(steps); });
+        neoview::bindFontScaleDpiRefresh(this, [this]() { applyFontScale(); });
+        applyDarkMode();
+        bindEvents();
+        createDocumentTab(true);
+        tryLoadCachedTlk();
+        refreshQuests();
+        clearQuestPanel();
+        clearEntryPanel();
+        setModuleStatusText(wxui::toWx(
+            std::string("NeoJRL v") + kVersion +
+            (tlk().has_value()
+                 ? " ready. Open global.jrl."
+                 : " ready. Open global.jrl; loading dialog.tlk is optional for resolved text.")));
+    }
+
+    bool activateResource(const std::string& identity) override {
+        if (identity.empty()) return false;
+        for (std::size_t i=0; i<documents_.size(); ++i)
+            if (documents_[i].resourceIdentity == identity) { selectDocumentTab(i); return true; }
+        return false;
+    }
+    std::size_t documentCount() const override { return documents_.size(); }
+    bool openFile(const std::filesystem::path& path) override { if(path.empty()) return false; openJrlPath(path); return true; }
+    neogff::GffFile* activeFile() override { return hasActiveDocument() ? &gff() : nullptr; }
+    void refreshActiveDocument() override { if (hasActiveDocument()) refreshQuests(); }
+    void setAppearance(bool dark, double scale) override { darkMode_=dark; fontScale_=scale; applyDarkMode(); }
+    bool canClose() override {
+        if (browserSaveActive_) return false;
+        return confirmCloseAllTabs();
+    }
+    std::vector<std::filesystem::path> openPaths() const override {
+        std::vector<std::filesystem::path> result;
+        for (const auto& document : documents_) {
+            const auto path = documentFilename(document);
+            if (!path.empty()) result.push_back(path);
+        }
+        return result;
+    }
+    bool openResource(neoshared::ResourceDocument input) override {
+        if (activateResource(input.identity)) return true;
+        auto candidate = std::make_unique<neogff::GffFile>();
+        neoshared::loadGffResource(input, *candidate, "JRL ");
+        (void)requireCategories(*candidate);
+        // Parse before creating/replacing a tab, so a failed load leaves the UI intact.
+        ensureDocumentTabForOpen();
+        auto& document = activeDocument();
+        document.gff = std::move(candidate);
+        document.logicalFilename.clear();
+        document.resourceIdentity = std::move(input.identity);
+        document.sourceDescription = std::move(input.sourceDescription);
+        document.protectedInputs = std::move(input.protectedInputs);
+        document.untitledName = std::move(input.fileName);
+#if defined(__EMSCRIPTEN__)
+        document.sourceImport.reset();
+#endif
+        authoringFlavor() = detectJournalFlavor(gff());
+        viewState().resetForNewDocument(); entryViewState().resetForNewDocument();
+        if (searchText_) searchText_->ChangeValue(wxString{});
+        tryLoadCachedTlk();
+
+        for (const auto& source : document.protectedInputs) {
+            tryLoadResolvedTlkForPath(source);
+            if (tlk().has_value()) break;
+        }
+        refreshQuests();
+        setModuleStatusText("Archive snapshot: " + document.sourceDescription + ". Save As creates a separate working file.");
+        return true;
+    }
+    bool saveActiveAs(const std::filesystem::path& path) override {
+        if (!hasActiveDocument() || !gff().loaded() || path.empty()) return false;
+        checkDestination(path);
+        return saveTo(path);
+    }
+
+private:
+    void checkOutput(const std::filesystem::path& path, bool exporting = false) const {
+        validateHostOutput(path);
+        for (const auto& document : documents_) {
+            neoshared::checkResourceOutput(path, document.protectedInputs);
+            if ((exporting || &document != &activeDocument()) &&
+                neoshared::sameResourcePath(path, documentFilename(document)))
+                throw std::runtime_error("That destination belongs to an open document. Choose a separate working file.");
+        }
+    }
+    void checkDestination(const std::filesystem::path& path) const {
+        checkOutput(path);
+        neoshared::checkGffOutputType(path, ".jrl");
+    }
+
+
+    struct DocumentTab {
+        std::unique_ptr<GffFile> gff = std::make_unique<GffFile>();
+        std::filesystem::path logicalFilename;
+        std::string resourceIdentity;
+        std::string sourceDescription;
+        std::vector<std::filesystem::path> protectedInputs;
+        std::optional<neotlk::TlkLookup> tlk;
+        std::filesystem::path tlkPath;
+        std::string tlkAutoLoadWarning;
+        neoview::DocumentViewState viewState;
+        neoview::DocumentViewState entryViewState;
+        JournalFlavor authoringFlavor = JournalFlavor::Unknown;
+        std::string untitledName = "Untitled JRL";
+        wxWindow* tabPage = nullptr;
+        bool saveInProgress = false;
+#if defined(__EMSCRIPTEN__)
+        neobrowser::BrowserImportLease sourceImport;
+#endif
+    };
+
+    bool hasActiveDocument() const {
+        return activeDocumentIndex_ != neotabs::npos && activeDocumentIndex_ < documents_.size();
+    }
+
+    DocumentTab& activeDocument() { return documents_.at(activeDocumentIndex_); }
+    const DocumentTab& activeDocument() const { return documents_.at(activeDocumentIndex_); }
+    GffFile& gff() { return *activeDocument().gff; }
+    const GffFile& gff() const { return *activeDocument().gff; }
+    std::optional<neotlk::TlkLookup>& tlk() { return activeDocument().tlk; }
+    const std::optional<neotlk::TlkLookup>& tlk() const { return activeDocument().tlk; }
+    std::filesystem::path& tlkPath() { return activeDocument().tlkPath; }
+    const std::filesystem::path& tlkPath() const { return activeDocument().tlkPath; }
+    std::string& tlkAutoLoadWarning() { return activeDocument().tlkAutoLoadWarning; }
+    const std::string& tlkAutoLoadWarning() const { return activeDocument().tlkAutoLoadWarning; }
+    neoview::DocumentViewState& viewState() { return activeDocument().viewState; }
+    const neoview::DocumentViewState& viewState() const { return activeDocument().viewState; }
+    neoview::DocumentViewState& entryViewState() { return activeDocument().entryViewState; }
+    const neoview::DocumentViewState& entryViewState() const { return activeDocument().entryViewState; }
+    JournalFlavor& authoringFlavor() { return activeDocument().authoringFlavor; }
+    JournalFlavor authoringFlavor() const { return activeDocument().authoringFlavor; }
+
+    std::filesystem::path documentFilename(const DocumentTab& tab) const {
+        if (!tab.logicalFilename.empty()) return tab.logicalFilename;
+        return tab.gff ? tab.gff->filename() : std::filesystem::path{};
+    }
+
+    bool tabDirty(const DocumentTab& tab) const {
+        return tab.saveInProgress || (tab.gff && tab.gff->dirty());
+    }
+
+    std::string tabDisplayName(const DocumentTab& tab) const {
+        return neotabs::displayNameForPath(documentFilename(tab), tab.untitledName);
+    }
+
+    void updateDocumentTabTitle(DocumentTab& document) {
+        neotabs::setTabLabel(documentTabs_, document.tabPage,
+                             tabDisplayName(document), tabDirty(document));
+    }
+
+    void updateActiveTabTitle() {
+        if (!hasActiveDocument()) return;
+        updateDocumentTabTitle(activeDocument());
+    }
+
+    void createDocumentTab(bool select = true) {
+        DocumentTab tab;
+        tab.gff = std::make_unique<GffFile>();
+        tab.viewState.resetForNewDocument();
+        tab.entryViewState.resetForNewDocument();
+        const std::size_t previousActiveIndex = activeDocumentIndex_;
+        documents_.push_back(std::move(tab));
+        const std::size_t index = documents_.size() - 1;
+
+        tabSwitchInProgress_ = true;
+        wxWindow* const page = neotabs::addTabPage(
+            documentTabs_, tabDisplayName(documents_.back()), tabDirty(documents_.back()), select);
+        if (page != nullptr) documents_.back().tabPage = page;
+        tabSwitchInProgress_ = false;
+
+        if (page == nullptr) {
+            documents_.pop_back();
+            activeDocumentIndex_ = previousActiveIndex;
+            throw std::runtime_error("Unable to create a document tab.");
+        }
+
+        if (select) {
+            activeDocumentIndex_ = index;
+            tabSwitchInProgress_ = true;
+            neotabs::changeSelectionToPage(documentTabs_, page);
+            tabSwitchInProgress_ = false;
+            refreshQuests();
+            clearQuestPanel();
+            clearEntryPanel();
+        }
+    }
+
+    bool activeTabIsReusableForOpen() const {
+        return hasActiveDocument() && documents_.size() == 1 && !tabDirty(activeDocument()) && !gff().loaded();
+    }
+
+    void ensureDocumentTabForOpen() {
+        if (!hasActiveDocument()) { createDocumentTab(true); return; }
+        if (!activeTabIsReusableForOpen()) createDocumentTab(true);
+    }
+
+#if defined(__EMSCRIPTEN__)
+    using BrowserImportCallback = std::function<void(neobrowser::BrowserImportLease)>;
+
+    void requestBrowserImport(const std::string& title,
+                              const std::string& accept,
+                              bool multiple,
+                              BrowserImportCallback callback) {
+        wxWeakRef<NeoJRLPanelImpl> weakSelf(this);
+        neobrowser::requestOpenFilesOwned(
+            title, accept, multiple,
+            [weakSelf, callback = std::move(callback)](
+                neobrowser::OwnedOpenFilesResult result) mutable {
+                if (!weakSelf || weakSelf->IsBeingDeleted()) return;
+                auto* const frame = weakSelf.get();
+                if (!result.error.empty()) {
+                    wxMessageBox(wxui::toWx(result.error), "File Open Error",
+                                 wxOK | wxICON_ERROR, frame);
+                    return;
+                }
+                if (result.cancelled()) return;
+                callback(std::move(result.import));
+            });
+    }
+
+    static bool importOwnsPath(const neobrowser::BrowserImportLease& import,
+                               const std::filesystem::path& path) {
+        return std::find(import.paths().begin(), import.paths().end(), path) !=
+               import.paths().end();
+    }
+#endif
+
+    std::optional<JournalFlavor> promptJournalFlavor(const wxString& title,
+                                                       const wxString& message) {
+        wxArrayString choices;
+        choices.Add("KotOR / KotOR II");
+        choices.Add("Neverwinter Nights / NWN2");
+        wxSingleChoiceDialog dialog(this, message, title, choices);
+        if (dialog.ShowModal() != wxID_OK) return std::nullopt;
+        return dialog.GetSelection() == 1
+            ? JournalFlavor::NeverwinterNights
+            : JournalFlavor::Kotor;
+    }
+
+    std::optional<JournalFlavor> flavorForNewQuest() {
+        const JournalFlavor detected = detectJournalFlavor(gff());
+        if (detected == JournalFlavor::Kotor ||
+            detected == JournalFlavor::NeverwinterNights) {
+            return detected;
+        }
+        if (detected == JournalFlavor::Unknown &&
+            (authoringFlavor() == JournalFlavor::Kotor ||
+             authoringFlavor() == JournalFlavor::NeverwinterNights)) {
+            return authoringFlavor();
+        }
+        return promptJournalFlavor(
+            "New Quest",
+            detected == JournalFlavor::Mixed
+                ? "This journal contains more than one schema. Choose the schema for the new quest:"
+                : "Choose the game-family schema for the new quest:");
+    }
+
+    std::string defaultJournalFilename() const {
+        return authoringFlavor() == JournalFlavor::NeverwinterNights
+            ? "module.jrl"
+            : "global.jrl";
+    }
+
+    void onNewJournal(wxCommandEvent&) {
+        try {
+            const auto flavor = promptJournalFlavor(
+                "New Journal",
+                "Choose the game-family schema for this journal:");
+            if (!flavor) return;
+
+            ensureDocumentTabForOpen();
+            gff().NewFile("JRL ");
+            initializeJournal(gff());
+            activeDocument().logicalFilename.clear();
+#if defined(__EMSCRIPTEN__)
+            activeDocument().sourceImport.reset();
+#endif
+            authoringFlavor() = *flavor;
+            activeDocument().untitledName = *flavor == JournalFlavor::NeverwinterNights
+                ? "Untitled NWN Journal"
+                : "Untitled KotOR Journal";
+            viewState().resetForNewDocument();
+            entryViewState().resetForNewDocument();
+            if (searchText_ != nullptr) searchText_->ChangeValue("");
+            tryLoadCachedTlk();
+            refreshQuests();
+            updateActiveTabTitle();
+            setModuleStatusText(*flavor == JournalFlavor::NeverwinterNights
+                    ? "Created an empty NWN/NWN2 journal. Use New Quest to add its first quest."
+                    : "Created an empty KotOR/KotOR II journal. Use New Quest to add its first quest.",
+                1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void selectDocumentTab(std::size_t index) {
+        if (documentTabs_ == nullptr || index >= documents_.size()) return;
+        tabSwitchInProgress_ = true;
+        const bool selected = neotabs::changeSelectionToPage(documentTabs_, documents_[index].tabPage);
+        tabSwitchInProgress_ = false;
+        if (!selected) return;
+        activeDocumentIndex_ = index;
+        refreshQuests();
+        loadSelectedQuest();
+        updateActiveTabTitle();
+    }
+
+    bool confirmCloseDocumentTab(std::size_t index) {
+        if (index >= documents_.size()) return true;
+        if (documents_[index].saveInProgress) {
+            wxui::showMessage(this, "Save in progress",
+                              "Finish the browser save transaction before closing this tab.");
+            return false;
+        }
+        if (!tabDirty(documents_[index])) return true;
+        return wxui::confirm(this, "Close tab", neotabs::closePromptText(tabDisplayName(documents_[index])));
+    }
+
+    bool closeDocumentTab(std::size_t index) {
+        if (index >= documents_.size() || !confirmCloseDocumentTab(index)) return false;
+
+        wxWindow* const page = documents_[index].tabPage;
+        tabSwitchInProgress_ = true;
+        const bool deleted = neotabs::deleteTabPage(documentTabs_, page);
+        tabSwitchInProgress_ = false;
+        if (!deleted) return false;
+
+        documents_.erase(documents_.begin() + static_cast<std::ptrdiff_t>(index));
+        if (documents_.empty()) {
+            activeDocumentIndex_ = neotabs::npos;
+            createDocumentTab(true);
+            return true;
+        }
+
+        std::size_t selectedIndex = neotabs::findDocumentIndexForPage(
+            documents_, neotabs::currentPage(documentTabs_));
+        if (selectedIndex == neotabs::npos) selectedIndex = std::min(index, documents_.size() - 1);
+        selectDocumentTab(selectedIndex);
+        return true;
+    }
+
+    bool confirmCloseAllTabs() {
+        for (std::size_t i = 0; i < documents_.size(); ++i) {
+            if (!confirmCloseDocumentTab(i)) return false;
+        }
+        return true;
+    }
+
+    void onDocumentTabChanged(wxAuiNotebookEvent& event) {
+        if (tabSwitchInProgress_) { event.Skip(); return; }
+        const int selection = event.GetSelection();
+        const std::size_t index = neotabs::findDocumentIndexForPage(
+            documents_, neotabs::pageForIndex(documentTabs_, selection));
+        if (index != neotabs::npos) selectDocumentTab(index);
+        event.Skip();
+    }
+
+    void onDocumentTabCloseRequested(wxAuiNotebookEvent& event) {
+        event.Veto();
+        const int selection = event.GetSelection();
+        if (selection < 0) return;
+        const std::size_t index = neotabs::findDocumentIndexForPage(
+            documents_, neotabs::pageForIndex(documentTabs_, selection));
+        if (index != neotabs::npos) closeDocumentTab(index);
+    }
+
+    void rebuildRecentFilesMenu() {
+        if (recentFilesMenu_ != nullptr) {
+            neosettings::populateRecentFilesMenu(*recentFilesMenu_, settings_, kRecentFileBaseId, kClearRecentFilesId);
+        }
+    }
+
+    void rememberRecentFile(const std::filesystem::path& path) {
+        settings_.addRecentFile(path);
+        rebuildRecentFilesMenu();
+    }
+
+    void tryLoadResolvedTlkForPath(const std::filesystem::path& path) {
+        if (tlk().has_value()) return;
+        const auto resolvedTlkPath = neogames::resolver().bestTlkForPath(path);
+        if (!resolvedTlkPath || resolvedTlkPath->empty()) return;
+        try {
+            tlk().emplace();
+            tlk()->load(*resolvedTlkPath);
+            tlkPath() = *resolvedTlkPath;
+            writeCachedTlkPath(*resolvedTlkPath);
+            tlkAutoLoadWarning().clear();
+        } catch (const std::exception& ex) {
+            tlkAutoLoadWarning() = std::string("Unable to auto-load resolved TLK: ") + ex.what();
+        }
+    }
+
+    void openJrlPath(const std::filesystem::path& path) {
+        if (path.empty()) return;
+        for (std::size_t i=0; i<documents_.size(); ++i) {
+            if (neoshared::sameResourcePath(path, documentFilename(documents_[i]))) {
+                selectDocumentTab(i); return;
+            }
+        }
+
+        auto candidate = std::make_unique<GffFile>();
+        candidate->LoadFile(path);
+        if (!neoshared::sameGffResourceType(candidate->filetype(), "JRL "))
+            throw std::runtime_error("The selected file is not a JRL resource.");
+        (void)requireCategories(*candidate);
+        ensureDocumentTabForOpen();
+        activeDocument().gff = std::move(candidate);
+        activeDocument().logicalFilename = path;
+        activeDocument().resourceIdentity.clear();
+        activeDocument().sourceDescription.clear();
+        activeDocument().protectedInputs.clear();
+#if defined(__EMSCRIPTEN__)
+        activeDocument().sourceImport.reset();
+#endif
+        authoringFlavor() = detectJournalFlavor(gff());
+        viewState().resetForNewDocument();
+        entryViewState().resetForNewDocument();
+        if (searchText_) searchText_->ChangeValue("");
+        tryLoadResolvedTlkForPath(path);
+        rememberRecentFile(path);
+        neogames::resolver().inferFromOpenedPath(path);
+        refreshQuests();
+    }
+
+#if defined(__EMSCRIPTEN__)
+    void openJrlPath(const std::filesystem::path& path,
+                     neobrowser::BrowserImportLease import) {
+        openJrlPath(path);
+        activeDocument().sourceImport = std::move(import);
+    }
+#endif
+
+    void onOpenRecent(wxCommandEvent& event) {
+        const int index = event.GetId() - kRecentFileBaseId;
+        const auto files = settings_.recentFiles();
+        if (index < 0 || static_cast<std::size_t>(index) >= files.size()) return;
+        try {
+            if (!std::filesystem::exists(files[static_cast<std::size_t>(index)])) {
+                settings_.removeRecentFile(files[static_cast<std::size_t>(index)]);
+                rebuildRecentFilesMenu();
+                throw std::runtime_error("Recent file no longer exists: " + files[static_cast<std::size_t>(index)].string());
+            }
+            openJrlPath(files[static_cast<std::size_t>(index)]);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onClearRecentFiles(wxCommandEvent&) {
+        settings_.clearRecentFiles();
+        rebuildRecentFilesMenu();
+    }
+
+
+
+    std::unique_ptr<neogames::OpenGameDirectoryMenu> gameDirectoryMenu_;
+
+    void buildMenus() {
+        auto* file = new wxMenu;
+        file->Append(ID_NewJournal, "&New Journal...\tCtrl+N");
+        file->Append(ID_Open, "&Open...\tCtrl+O");
+        recentFilesMenu_ = new wxMenu;
+        rebuildRecentFilesMenu();
+        file->AppendSubMenu(recentFilesMenu_, "Open &Recent");
+        file->Append(ID_LoadTlk, "Load optional &dialog.tlk...");
+        file->Append(ID_Save, "&Save\tCtrl+S");
+        file->Append(ID_SaveAs, "Save &As...");
+        file->AppendSeparator();
+        file->Append(ID_CloseTab, "&Close Tab\tCtrl-W");
+        file->Append(ID_CloseOtherTabs, "Close &Other Tabs");
+        file->Append(ID_NextTab, "Next Tab\tCtrl-Tab");
+        file->Append(ID_PreviousTab, "Previous Tab\tCtrl-Shift-Tab");
+        gameDirectoryMenu_ = neogames::appendOpenGameDirectoryMenu(
+            *this, *file, [this](const std::filesystem::path& directory) {
+                chooseAndOpenJrl(directory);
+            });
+        file->AppendSeparator();
+        if (!context_.embedded) file->Append(ID_ModuleExit, "E&xit");
+
+        auto* import = new wxMenu;
+        import->Append(ID_ImportXml, "Import &XML...");
+        import->Append(ID_ImportJson, "Import &JSON...");
+
+        auto* exportMenu = new wxMenu;
+        exportMenu->Append(ID_ExportXml, "Export as &XML...");
+        exportMenu->Append(ID_ExportJson, "Export as &JSON...");
+        exportMenu->AppendSeparator();
+        exportMenu->Append(ID_ExportPatcher, "Export TSL/HoloPatcher Instructions...");
+
+        auto* edit = new wxMenu;
+        edit->Append(ID_CopyCells, "&Copy Selection	Ctrl-C");
+        edit->Append(ID_PasteCells, "&Paste Values	Ctrl-V");
+        edit->AppendSeparator();
+        edit->Append(ID_ApplyQuest, "Apply &Quest");
+        edit->Append(ID_ApplyEntry, "Apply &Entry");
+        edit->AppendSeparator();
+        edit->Append(ID_NewQuest, "&New Quest");
+        edit->Append(ID_DeleteQuest, "&Delete Quest");
+        edit->AppendSeparator();
+        edit->Append(ID_NewEntry, "New &Entry");
+        edit->Append(ID_DeleteEntry, "Delete E&ntry");
+
+        auto* tools = new wxMenu;
+        tools->Append(ID_ApplySearchFilter, "Apply Search as Quest &Filter");
+        tools->Append(ID_FilterColumn, "Filter Selected &Column...");
+        tools->Append(ID_ClearColumnFilter, "Clear Filter on Selected Column");
+        tools->Append(ID_ClearAllFilters, "Clear All Filters");
+
+        auto* view = new wxMenu;
+        if (!context_.embedded) {
+        darkModeItem_ = view->AppendCheckItem(ID_DarkMode, "&Dark Mode");
+        view->AppendSeparator();
+        view->Append(ID_FontIncrease, "Increase Font Size\tCtrl++");
+        view->Append(ID_FontDecrease, "Decrease Font Size\tCtrl+-");
+        view->Append(ID_FontReset, "Reset Font Size\tCtrl+0");
+        }
+        view->AppendSeparator();
+        view->Append(ID_ResetColumnOrder, "Reset Column Order");
+        view->Append(ID_ResetRowOrder, "Reset Row Order");
+
+        auto* help = new wxMenu;
+        help->Append(ID_ModuleAbout, "&About");
+
+        auto* bar = new wxMenuBar;
+        bar->Append(file, "&File");
+        bar->Append(import, "&Import");
+        bar->Append(exportMenu, "&Export");
+        bar->Append(edit, "&Edit");
+        bar->Append(tools, "&Tools");
+        bar->Append(view, "&View");
+        if (!context_.embedded) bar->Append(help, "&Help"); else delete help;
+        setModuleMenus(bar);
+    }
+
+    void buildLayout() {
+        auto* panel = new wxPanel(this);
+        auto* root = new wxBoxSizer(wxVERTICAL);
+
+        documentTabs_ = new wxAuiNotebook(panel, ID_DocumentTabs, wxDefaultPosition, wxDefaultSize,
+                                          wxAUI_NB_TOP | wxAUI_NB_TAB_MOVE | wxAUI_NB_CLOSE_ON_ACTIVE_TAB | wxAUI_NB_SCROLL_BUTTONS);
+        root->Add(documentTabs_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
+        neotabs::configureDocumentTabStrip(documentTabs_);
+
+        root->Add(buildSearchBar(panel), 0, wxEXPAND | wxALL, 6);
+
+        auto* main = new wxSplitterWindow(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxSP_LIVE_UPDATE);
+        auto* left = new wxPanel(main);
+        auto* right = new wxPanel(main);
+
+        auto* leftSizer = new wxBoxSizer(wxVERTICAL);
+        leftSizer->Add(new wxStaticText(left, wxID_ANY, "Quests"), 0, wxLEFT | wxTOP, 4);
+        questList_ = new wxListCtrl(left, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                    wxLC_REPORT | wxLC_SINGLE_SEL | wxLC_HRULES | wxLC_VRULES);
+        questList_->SetName("NeoJRL quests");
+        wxui::setColumns(*questList_, {{"#", 55}, {"Tag", 205}});
+        leftSizer->Add(questList_, 1, wxEXPAND | wxALL, 4);
+        auto* questButtons = new wxBoxSizer(wxHORIZONTAL);
+        questButtons->Add(new wxButton(left, ID_NewQuest, "New Quest"), 0, wxRIGHT, FromDIP(4));
+        questButtons->Add(new wxButton(left, ID_DeleteQuest, "Delete Quest"), 0);
+        leftSizer->Add(questButtons, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+        left->SetSizer(leftSizer);
+
+        auto* rightSizer = new wxBoxSizer(wxVERTICAL);
+        rightSizer->Add(buildQuestPanel(right), 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
+        rightSizer->Add(buildEntryListAndPanel(right), 1, wxEXPAND | wxALL, 4);
+        right->SetSizer(rightSizer);
+
+        main->SplitVertically(left, right);
+        main->SetSashGravity(0.30);
+        main->SetMinimumPaneSize(FromDIP(220));
+        root->Add(main, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 6);
+        panel->SetSizer(root);
+        auto* moduleLayout = new wxBoxSizer(wxVERTICAL);
+        moduleLayout->Add(panel, 1, wxEXPAND);
+        SetSizer(moduleLayout);
+
+        createModuleStatusBar(2);
+        int widths[] = {-2, -3};
+        moduleStatusBar()->SetStatusWidths(2, widths);
+    }
+
+    wxSizer* buildSearchBar(wxWindow* parent) {
+        auto* box = new wxStaticBoxSizer(wxVERTICAL, parent, "Journal");
+
+        auto* jrlRow = new wxBoxSizer(wxHORIZONTAL);
+        jrlRow->Add(new wxStaticText(parent, wxID_ANY, "JRL file:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(6));
+        filePath_ = new wxTextCtrl(parent, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
+        jrlRow->Add(filePath_, 1, wxEXPAND | wxRIGHT, FromDIP(6));
+        jrlRow->Add(new wxButton(parent, ID_Open, "Open..."), 0, wxRIGHT, FromDIP(4));
+        jrlRow->Add(new wxButton(parent, ID_Save, "Save"), 0, wxRIGHT, FromDIP(4));
+        jrlRow->Add(new wxButton(parent, ID_SaveAs, "Save As..."), 0);
+        box->Add(jrlRow, 0, wxEXPAND | wxALL, FromDIP(8));
+
+        auto* tlkRow = new wxBoxSizer(wxHORIZONTAL);
+        tlkRow->Add(new wxStaticText(parent, wxID_ANY, "dialog.tlk:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(6));
+        tlkPathText_ = new wxTextCtrl(parent, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
+        tlkRow->Add(tlkPathText_, 1, wxEXPAND | wxRIGHT, FromDIP(6));
+        tlkRow->Add(new wxButton(parent, ID_LoadTlk, "Load optional TLK..."), 0);
+        box->Add(tlkRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(8));
+
+        auto* searchRow = new wxBoxSizer(wxHORIZONTAL);
+        searchRow->Add(new wxStaticText(parent, wxID_ANY, "Search/filter:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(6));
+        searchMode_ = new wxChoice(parent, wxID_ANY);
+        searchMode_->Append("Quest Tag");
+        searchMode_->Append("Quest Name");
+        searchMode_->Append("Quest Stage Text");
+        searchMode_->Append("PlanetID");
+        searchMode_->Append("Priority");
+        searchMode_->Append("PlotIndex");
+        searchMode_->Append("Picture");
+        searchMode_->Append("Quest XP");
+        searchMode_->SetSelection(0);
+        searchRow->Add(searchMode_, 0, wxRIGHT, FromDIP(6));
+        searchText_ = new wxTextCtrl(parent, wxID_ANY);
+        searchRow->Add(searchText_, 1, wxEXPAND | wxRIGHT, FromDIP(6));
+        searchRow->Add(new wxButton(parent, ID_Search, "Search"), 0);
+        box->Add(searchRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(8));
+
+        return box;
+    }
+
+    wxSizer* buildQuestPanel(wxWindow* parent) {
+        auto* box = new wxStaticBoxSizer(wxVERTICAL, parent, "Quest");
+        auto* form = new wxFlexGridSizer(2, 2, 5, 8);
+        form->AddGrowableCol(1, 1);
+
+        profileLabel_ = new wxStaticText(parent, wxID_ANY, "Detected profile");
+        form->Add(profileLabel_, 0, wxALIGN_CENTER_VERTICAL);
+        profile_ = new wxTextCtrl(parent, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
+        form->Add(profile_, 1, wxEXPAND);
+
+        nameStrRef_ = addText(parent, form, "Name StrRef");
+        name_ = addText(parent, form, "Name text");
+        name_->SetToolTip("When Name StrRef is -1, this edits the embedded language-0 name. Otherwise it shows the resolved TLK text.");
+        tag_ = addText(parent, form, "Tag");
+        tag_->SetName("NeoJRL quest tag");
+        comment_ = addText(parent, form, "Comment");
+        priority_ = addText(parent, form, "Sort priority");
+        picture_ = addText(parent, form, "Journal picture ID");
+        planet_ = addText(parent, form, "Planet ID", &planetLabel_);
+        plotIndex_ = addText(parent, form, "PlotXP.2da row", &plotIndexLabel_);
+        questXp_ = addText(parent, form, "Quest XP", &questXpLabel_);
+
+        box->Add(form, 0, wxEXPAND | wxALL, 6);
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        row->AddStretchSpacer(1);
+        row->Add(new wxButton(parent, ID_ApplyQuest, "Apply Quest"), 0, wxRIGHT, 6);
+        box->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 6);
+        return box;
+    }
+
+    wxWindow* buildEntryListAndPanel(wxWindow* parent) {
+        auto* splitter = new wxSplitterWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxSP_LIVE_UPDATE);
+        auto* entriesPanel = new wxPanel(splitter);
+        auto* detailPanel = new wxPanel(splitter);
+
+        auto* entriesSizer = new wxStaticBoxSizer(wxVERTICAL, entriesPanel, "Entries");
+        entryList_ = new wxListCtrl(entriesPanel, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                    wxLC_REPORT | wxLC_SINGLE_SEL | wxLC_HRULES | wxLC_VRULES);
+        entryList_->SetName("NeoJRL entries");
+        wxui::setColumns(*entryList_, {{"#", 55}, {"ID", 95}});
+        entriesSizer->Add(entryList_, 1, wxEXPAND | wxALL, 4);
+        auto* entryButtons = new wxBoxSizer(wxHORIZONTAL);
+        entryButtons->Add(new wxButton(entriesPanel, ID_NewEntry, "New Entry"), 0, wxRIGHT, 4);
+        entryButtons->Add(new wxButton(entriesPanel, ID_DeleteEntry, "Delete Entry"), 0);
+        entriesSizer->Add(entryButtons, 0, wxLEFT | wxRIGHT | wxBOTTOM, 4);
+        entriesPanel->SetSizer(entriesSizer);
+
+        auto* detailSizer = new wxStaticBoxSizer(wxVERTICAL, detailPanel, "Selected Entry");
+        auto* form = new wxFlexGridSizer(4, 2, 5, 8);
+        form->AddGrowableCol(1, 1);
+        entryId_ = addText(detailPanel, form, "Entry ID");
+        entryXp_ = addText(detailPanel, form, "Plot XP multiplier", &entryXpLabel_);
+        entryXp_->SetToolTip("KotOR multiplies PlotXP.2da XP by this value: 0.5 = 50%, 1.0 = 100%.");
+        form->Add(new wxStaticText(detailPanel, wxID_ANY, "End"), 0, wxALIGN_CENTER_VERTICAL);
+        entryEnd_ = new wxCheckBox(detailPanel, wxID_ANY, wxEmptyString);
+        form->Add(entryEnd_, 0, wxALIGN_CENTER_VERTICAL);
+        entryStrRef_ = addText(detailPanel, form, "StrRef");
+        detailSizer->Add(form, 0, wxEXPAND | wxALL, 6);
+        detailSizer->Add(new wxStaticText(detailPanel, wxID_ANY, "Entry Text"), 0, wxLEFT | wxRIGHT, 6);
+        entryText_ = new wxTextCtrl(detailPanel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize,
+                                    wxTE_MULTILINE | wxTE_RICH2);
+        entryText_->SetName("NeoJRL entry text");
+        detailSizer->Add(entryText_, 1, wxEXPAND | wxALL, 6);
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        row->AddStretchSpacer(1);
+        row->Add(new wxButton(detailPanel, ID_ApplyEntry, "Apply Entry"), 0, wxRIGHT, 6);
+        detailSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 6);
+        detailPanel->SetSizer(detailSizer);
+
+        splitter->SplitVertically(entriesPanel, detailPanel);
+        splitter->SetSashGravity(0.35);
+        splitter->SetMinimumPaneSize(FromDIP(140));
+        return splitter;
+    }
+
+    wxTextCtrl* addText(wxWindow* parent,
+                        wxSizer* sizer,
+                        const char* label,
+                        wxStaticText** labelOut = nullptr,
+                        long style = 0) {
+        auto* caption = new wxStaticText(parent, wxID_ANY, label);
+        if (labelOut != nullptr) *labelOut = caption;
+        sizer->Add(caption, 0, wxALIGN_CENTER_VERTICAL);
+        auto* ctrl = new wxTextCtrl(parent, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, style);
+        sizer->Add(ctrl, 1, wxEXPAND);
+        return ctrl;
+    }
+
+    void bindEvents() {
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onNewJournal, this, ID_NewJournal);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onOpen, this, ID_Open);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onOpenRecent, this, kRecentFileBaseId, kRecentFileBaseId + neosettings::kMaxRecentFiles - 1);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onClearRecentFiles, this, kClearRecentFilesId);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onLoadTlk, this, ID_LoadTlk);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onSave, this, ID_Save);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onSaveAs, this, ID_SaveAs);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onCloseTab, this, ID_CloseTab);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onCloseOtherTabs, this, ID_CloseOtherTabs);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onNextTab, this, ID_NextTab);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onPreviousTab, this, ID_PreviousTab);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onSearch, this, ID_Search);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onApplySearchFilter, this, ID_ApplySearchFilter);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onClearFilter, this, ID_ClearFilter);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onFilterSelectedColumn, this, ID_FilterColumn);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onClearSelectedColumnFilter, this, ID_ClearColumnFilter);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onClearAllFilters, this, ID_ClearAllFilters);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onResetColumnOrder, this, ID_ResetColumnOrder);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onResetRowOrder, this, ID_ResetRowOrder);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onApplyQuest, this, ID_ApplyQuest);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onApplyEntry, this, ID_ApplyEntry);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onNewQuest, this, ID_NewQuest);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onDeleteQuest, this, ID_DeleteQuest);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onNewEntry, this, ID_NewEntry);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onDeleteEntry, this, ID_DeleteEntry);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onCopyCells, this, ID_CopyCells);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onPasteCells, this, ID_PasteCells);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { onImport(neotabular::Format::Xml); }, ID_ImportXml);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { onImport(neotabular::Format::Json); }, ID_ImportJson);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { onExport(neotabular::Format::Xml); }, ID_ExportXml);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { onExport(neotabular::Format::Json); }, ID_ExportJson);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { onExportPatcher(); }, ID_ExportPatcher);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onToggleDarkMode, this, ID_DarkMode);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onIncreaseFontScale, this, ID_FontIncrease);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onDecreaseFontScale, this, ID_FontDecrease);
+        Bind(wxEVT_MENU, &NeoJRLPanelImpl::onResetFontScale, this, ID_FontReset);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { requestModuleClose(); }, ID_ModuleExit);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+            wxui::showMessage(this, "About NeoJRL", std::string("NeoJRL v") + kVersion + "\nNative wxWidgets journal editor\n\nA special thanks to everyone in the KOTOR modding community that has contributed their work, knowledge, and creativity to making tools, mods, and guides over the last 20+ years");
+        }, ID_ModuleAbout);
+        documentTabs_->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, &NeoJRLPanelImpl::onDocumentTabChanged, this);
+        documentTabs_->Bind(wxEVT_AUINOTEBOOK_PAGE_CLOSE, &NeoJRLPanelImpl::onDocumentTabCloseRequested, this);
+
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_Open);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_LoadTlk);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_Save);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_SaveAs);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_Search);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_ApplyQuest);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_ApplyEntry);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_NewQuest);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_DeleteQuest);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_NewEntry);
+        Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_DeleteEntry);
+        questList_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) { loadSelectedQuest(); });
+        entryList_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) { loadSelectedEntry(); });
+        questList_->Bind(wxEVT_LIST_COL_RIGHT_CLICK, &NeoJRLPanelImpl::onQuestColumnRightClick, this);
+        entryList_->Bind(wxEVT_LIST_COL_RIGHT_CLICK, &NeoJRLPanelImpl::onEntryColumnRightClick, this);
+    }
+
+    void dispatchButton(wxCommandEvent& event) {
+        wxCommandEvent menuEvent(wxEVT_MENU, event.GetId());
+        ProcessWindowEvent(menuEvent);
+    }
+
+    void ensureLoaded() const {
+        if (!gff().loaded()) {
+            throw std::runtime_error("No journal file is loaded.");
+        }
+    }
+
+    void updateHeaderPaths() {
+        if (filePath_ != nullptr) {
+            const std::filesystem::path filename = documentFilename(activeDocument());
+            const std::string path = gff().loaded()
+                ? (filename.empty() ? (activeDocument().sourceDescription.empty()
+                    ? activeDocument().untitledName + " (unsaved)"
+                    : activeDocument().sourceDescription + " (archive snapshot)")
+                                    : filename.string())
+                : std::string();
+            if (wxui::toStd(filePath_->GetValue()) != path) filePath_->ChangeValue(wxui::toWx(path));
+        }
+        if (tlkPathText_ != nullptr) {
+            const std::string path = tlk().has_value() ? tlkPath().string() : std::string();
+            if (wxui::toStd(tlkPathText_->GetValue()) != path) tlkPathText_->ChangeValue(wxui::toWx(path));
+        }
+    }
+
+    void updateQuestColumnLabels() {
+        neoview::ensureIdentityColumns(viewState(), 2);
+        for (std::size_t visualColumn = 0; visualColumn < 2; ++visualColumn) {
+            const std::size_t logicalColumn = neoview::logicalColumnForVisual(viewState(), visualColumn);
+            std::string label = questColumnLabel(logicalColumn);
+            if (neoview::findColumnFilter(viewState(), logicalColumn) != nullptr) {
+                label += " *";
+            }
+            wxListItem item;
+            item.SetMask(wxLIST_MASK_TEXT);
+            item.SetText(wxui::toWx(label));
+            questList_->SetColumn(static_cast<int>(visualColumn), item);
+        }
+    }
+
+    void updateEntryColumnLabels() {
+        neoview::ensureIdentityColumns(entryViewState(), 2);
+        for (std::size_t visualColumn = 0; visualColumn < 2; ++visualColumn) {
+            const std::size_t logicalColumn = neoview::logicalColumnForVisual(entryViewState(), visualColumn);
+            std::string label = entryColumnLabel(logicalColumn);
+            if (neoview::findColumnFilter(entryViewState(), logicalColumn) != nullptr) {
+                label += " *";
+            }
+            wxListItem item;
+            item.SetMask(wxLIST_MASK_TEXT);
+            item.SetText(wxui::toWx(label));
+            entryList_->SetColumn(static_cast<int>(visualColumn), item);
+        }
+    }
+
+    std::string questFilterCell(std::size_t questIndex, const GffStruct& quest, std::size_t logicalColumn) const {
+        switch (logicalColumn) {
+            case 0: return std::to_string(questIndex);
+            case 1: return fieldText(quest, "Tag");
+            default: return {};
+        }
+    }
+
+    bool questPassesCurrentFilters(std::size_t questIndex, const GffStruct& quest) const {
+        if (!viewState().filterTerm.empty()) {
+            if (!matchesQuest(viewState().sortColumn, quest, viewState().filterTerm)) {
+                return false;
+            }
+        }
+        return neoview::rowPassesColumnFilters(viewState(), [&](std::size_t logicalColumn) {
+            return questFilterCell(questIndex, quest, logicalColumn);
+        });
+    }
+
+    std::string entryFilterCell(std::size_t entryIndex, const GffStruct& stage, std::size_t logicalColumn) const {
+        switch (logicalColumn) {
+            case 0: return std::to_string(entryIndex);
+            case 1: return fieldText(stage, "ID");
+            default: return {};
+        }
+    }
+
+    bool entryPassesCurrentFilters(std::size_t entryIndex, const GffStruct& stage) const {
+        return neoview::rowPassesColumnFilters(entryViewState(), [&](std::size_t logicalColumn) {
+            return entryFilterCell(entryIndex, stage, logicalColumn);
+        });
+    }
+
+    void appendMappedRow(wxListCtrl& list, const std::vector<std::string>& cells, const neoview::DocumentViewState& state, std::size_t logicalIndex) {
+        const std::string first = neoview::logicalColumnForVisual(state, 0) < cells.size() ? cells[neoview::logicalColumnForVisual(state, 0)] : std::string();
+        const long row = list.InsertItem(list.GetItemCount(), wxui::toWx(first));
+        for (std::size_t visualColumn = 1; visualColumn < cells.size(); ++visualColumn) {
+            const std::size_t logicalColumn = neoview::logicalColumnForVisual(state, visualColumn);
+            list.SetItem(row, static_cast<int>(visualColumn), wxui::toWx(logicalColumn < cells.size() ? cells[logicalColumn] : std::string()));
+        }
+        list.SetItemData(row, static_cast<long>(logicalIndex));
+    }
+
+    void selectQuestIndex(std::size_t questIndex) {
+        for (long row = 0; row < questList_->GetItemCount(); ++row) {
+            if (static_cast<std::size_t>(questList_->GetItemData(row)) == questIndex) {
+                wxui::selectRow(*questList_, row);
+                return;
+            }
+        }
+    }
+
+    void selectEntryIndex(std::size_t entryIndex) {
+        for (long row = 0; row < entryList_->GetItemCount(); ++row) {
+            if (static_cast<std::size_t>(entryList_->GetItemData(row)) == entryIndex) {
+                wxui::selectRow(*entryList_, row);
+                return;
+            }
+        }
+    }
+
+    void refreshQuests() {
+        updateHeaderPaths();
+        questList_->DeleteAllItems();
+        entryList_->DeleteAllItems();
+        neoview::removeColumnFiltersOutsideRange(viewState(), 2);
+        neoview::removeColumnFiltersOutsideRange(entryViewState(), 2);
+        neoview::ensureIdentityColumns(viewState(), 2);
+        neoview::ensureIdentityColumns(entryViewState(), 2);
+        updateQuestColumnLabels();
+        updateEntryColumnLabels();
+        viewState().primarySelection.reset();
+        viewState().secondarySelection.reset();
+        clearQuestPanel();
+        clearEntryPanel();
+        if (!gff().loaded()) {
+            neoview::setIdentityRows(viewState(), 0);
+            neoview::setIdentityRows(entryViewState(), 0);
+            setModuleStatusText("No journal loaded", 0);
+            setModuleStatusText(tlk().has_value() ? wxui::toWx("TLK: " + tlkPath().string()) : wxui::toWx(tlkAutoLoadWarning().empty() ? std::string("No TLK loaded") : tlkAutoLoadWarning()), 1);
+            return;
+        }
+        const auto& categories = requireCategories(gff());
+        std::vector<std::size_t> visibleQuests;
+        for (std::size_t i = 0; i < categories.count(); ++i) {
+            const auto* quest = categories.GetStruct(i);
+            if (quest == nullptr || !questPassesCurrentFilters(i, *quest)) {
+                continue;
+            }
+            visibleQuests.push_back(i);
+            appendMappedRow(*questList_, {std::to_string(i), fieldText(*quest, "Tag")}, viewState(), i);
+        }
+        neoview::setRowsFromLogicalRows(viewState(), visibleQuests);
+        wxui::applyTheme(questList_, darkMode_);
+        const std::filesystem::path filename = documentFilename(activeDocument());
+        const std::string journalLabel = filename.empty()
+            ? activeDocument().untitledName
+            : filename.string();
+        std::string questStatus = "JRL: " + journalLabel + "  Quests: " +
+                                  std::to_string(visibleQuests.size()) + "/" +
+                                  std::to_string(categories.count());
+        const std::string summary = neoview::columnFilterSummary(viewState());
+        if (!viewState().filterTerm.empty()) {
+            questStatus += "  Search filter: " + viewState().filterTerm;
+        }
+        if (!summary.empty()) {
+            questStatus += "  Column filters: " + summary;
+        }
+        setModuleStatusText(wxui::toWx(questStatus), 0);
+        updateActiveTabTitle();
+        setModuleStatusText(tlk().has_value() ? wxui::toWx("TLK: " + tlkPath().string()) : wxui::toWx(tlkAutoLoadWarning().empty() ? std::string("No TLK loaded") : tlkAutoLoadWarning()), 1);
+        if (!visibleQuests.empty()) {
+            wxui::selectRow(*questList_, 0);
+            loadSelectedQuest();
+        }
+    }
+
+    void refreshEntries(std::size_t questIndex) {
+        entryList_->DeleteAllItems();
+        neoview::removeColumnFiltersOutsideRange(entryViewState(), 2);
+        neoview::ensureIdentityColumns(entryViewState(), 2);
+        updateEntryColumnLabels();
+        viewState().secondarySelection.reset();
+        clearEntryPanel();
+        const auto& categories = requireCategories(gff());
+        const auto* quest = categories.GetStruct(questIndex);
+        const auto* entries = quest ? questEntries(*quest) : nullptr;
+        if (entries == nullptr) {
+            neoview::setIdentityRows(entryViewState(), 0);
+            return;
+        }
+        std::vector<std::size_t> visibleEntries;
+        for (std::size_t i = 0; i < entries->count(); ++i) {
+            const auto* stage = entries->GetStruct(i);
+            if (stage == nullptr || !entryPassesCurrentFilters(i, *stage)) {
+                continue;
+            }
+            visibleEntries.push_back(i);
+            appendMappedRow(*entryList_, {std::to_string(i), fieldText(*stage, "ID")}, entryViewState(), i);
+        }
+        neoview::setRowsFromLogicalRows(entryViewState(), visibleEntries);
+        wxui::applyTheme(entryList_, darkMode_);
+        if (!visibleEntries.empty()) {
+            wxui::selectRow(*entryList_, 0);
+            loadSelectedEntry();
+        }
+    }
+
+    void updateQuestFieldVisibility(JournalFlavor flavor) {
+        const bool showKotor = flavor != JournalFlavor::NeverwinterNights;
+        const bool showNwn = flavor != JournalFlavor::Kotor;
+        for (wxWindow* window : {static_cast<wxWindow*>(planetLabel_), static_cast<wxWindow*>(planet_),
+                                 static_cast<wxWindow*>(plotIndexLabel_), static_cast<wxWindow*>(plotIndex_)}) {
+            if (window != nullptr) window->Show(showKotor);
+        }
+        for (wxWindow* window : {static_cast<wxWindow*>(questXpLabel_), static_cast<wxWindow*>(questXp_)}) {
+            if (window != nullptr) window->Show(showNwn);
+        }
+        for (wxWindow* window : {static_cast<wxWindow*>(entryXpLabel_), static_cast<wxWindow*>(entryXp_)}) {
+            if (window != nullptr) window->Show(showKotor);
+        }
+        Layout();
+    }
+
+    void clearQuestPanel() {
+        profile_->Clear();
+        nameStrRef_->Clear();
+        name_->Clear();
+        comment_->Clear();
+        tag_->Clear();
+        planet_->Clear();
+        priority_->Clear();
+        plotIndex_->Clear();
+        picture_->Clear();
+        questXp_->Clear();
+        updateQuestFieldVisibility(JournalFlavor::Unknown);
+    }
+
+    void clearEntryPanel() {
+        entryId_->Clear();
+        entryXp_->Clear();
+        entryStrRef_->Clear();
+        entryText_->Clear();
+        if (entryEnd_ != nullptr) {
+            entryEnd_->SetValue(false);
+        }
+    }
+
+    void loadSelectedQuest() {
+        if (!gff().loaded()) {
+            return;
+        }
+        const long row = wxui::selectedRow(*questList_);
+        if (row < 0) {
+            return;
+        }
+        try {
+            const auto& categories = requireCategories(gff());
+            const auto questIndex = static_cast<std::size_t>(questList_->GetItemData(row));
+            const auto* quest = categories.GetStruct(questIndex);
+            if (quest == nullptr) {
+                return;
+            }
+            viewState().primarySelection = questIndex;
+            viewState().secondarySelection.reset();
+            JournalFlavor flavor = detectJournalQuestFlavor(gff(), questIndex);
+            if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
+            profile_->SetValue(wxui::toWx(journalFlavorDisplayName(flavor)));
+            updateQuestFieldVisibility(flavor);
+            nameStrRef_->SetValue(wxui::toWx(locStrRefText(*quest, "Name")));
+            name_->SetValue(wxui::toWx(locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr)));
+            comment_->SetValue(wxui::toWx(fieldText(*quest, "Comment")));
+            tag_->SetValue(wxui::toWx(fieldText(*quest, "Tag")));
+            planet_->SetValue(wxui::toWx(fieldText(*quest, "PlanetID")));
+            priority_->SetValue(wxui::toWx(fieldText(*quest, "Priority")));
+            plotIndex_->SetValue(wxui::toWx(fieldText(*quest, "PlotIndex")));
+            picture_->SetValue(wxui::toWx(fieldText(*quest, "Picture")));
+            questXp_->SetValue(wxui::toWx(fieldText(*quest, "XP")));
+            refreshEntries(*viewState().primarySelection);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void loadSelectedEntry() {
+        if (!gff().loaded() || !viewState().primarySelection) {
+            return;
+        }
+        const long row = wxui::selectedRow(*entryList_);
+        if (row < 0) {
+            return;
+        }
+        try {
+            const auto entryIndex = static_cast<std::size_t>(entryList_->GetItemData(row));
+            const GffStruct* stage = selectedEntry(entryIndex);
+            if (stage == nullptr) {
+                return;
+            }
+            viewState().secondarySelection = entryIndex;
+            entryId_->SetValue(wxui::toWx(fieldText(*stage, "ID")));
+            entryXp_->SetValue(wxui::toWx(fieldText(*stage, "XP_Percentage")));
+            entryEnd_->SetValue(fieldText(*stage, "End") != "0");
+            entryStrRef_->SetValue(wxui::toWx(locStrRefText(*stage, "Text")));
+            entryText_->SetValue(wxui::toWx(locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr)));
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    const GffStruct* selectedEntry(std::size_t entryIndex) const {
+        if (!viewState().primarySelection) {
+            return nullptr;
+        }
+        const auto& categories = requireCategories(gff());
+        const auto* quest = categories.GetStruct(*viewState().primarySelection);
+        const auto* entries = quest ? questEntries(*quest) : nullptr;
+        return entries ? entries->GetStruct(entryIndex) : nullptr;
+    }
+
+
+    neotabular::Table currentTable() const {
+        neotabular::Table table;
+        table.columns = {"Kind", "QuestIndex", "EntryIndex", "Field", "Value"};
+        if (!gff().loaded()) return table;
+        const auto& categories = requireCategories(gff());
+        for (std::size_t qi = 0; qi < categories.count(); ++qi) {
+            const auto* quest = categories.GetStruct(qi);
+            if (!quest) continue;
+            for (const auto& fieldName : {"Tag", "Comment", "PlanetID", "Priority", "Picture", "PlotIndex", "XP"}) {
+                table.rows.push_back({"Quest", std::to_string(qi), "", fieldName, fieldText(*quest, fieldName)});
+            }
+            table.rows.push_back({"Quest", std::to_string(qi), "", "Name(strref)", locStrRefText(*quest, "Name")});
+            table.rows.push_back({"Quest", std::to_string(qi), "", "Name(lang0)", locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr)});
+            const auto* entries = questEntries(*quest);
+            if (!entries) continue;
+            for (std::size_t si = 0; si < entries->count(); ++si) {
+                const auto* stage = entries->GetStruct(si);
+                if (!stage) continue;
+                for (const auto& fieldName : {"ID", "XP_Percentage", "End"}) {
+                    table.rows.push_back({"Entry", std::to_string(qi), std::to_string(si), fieldName, fieldText(*stage, fieldName)});
+                }
+                table.rows.push_back({"Entry", std::to_string(qi), std::to_string(si), "Text(strref)", locStrRefText(*stage, "Text")});
+                table.rows.push_back({"Entry", std::to_string(qi), std::to_string(si), "Text(lang0)", locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr)});
+            }
+        }
+        return table;
+    }
+
+    neotabular::Table selectedTable() const {
+        neotabular::Table table;
+        table.columns = {"Kind", "QuestIndex", "EntryIndex", "Field", "Value"};
+        if (!gff().loaded() || !viewState().primarySelection) return table;
+        const auto& categories = requireCategories(gff());
+        const auto* quest = categories.GetStruct(*viewState().primarySelection);
+        if (!quest) return table;
+        for (const auto& fieldName : {"Tag", "Comment", "PlanetID", "Priority", "Picture", "PlotIndex", "XP"}) {
+            table.rows.push_back({"Quest", std::to_string(*viewState().primarySelection), "", fieldName, fieldText(*quest, fieldName)});
+        }
+        if (viewState().secondarySelection) {
+            const auto* stage = selectedEntry(*viewState().secondarySelection);
+            if (stage) {
+                for (const auto& fieldName : {"ID", "XP_Percentage", "End"}) {
+                    table.rows.push_back({"Entry", std::to_string(*viewState().primarySelection), std::to_string(*viewState().secondarySelection), fieldName, fieldText(*stage, fieldName)});
+                }
+                table.rows.push_back({"Entry", std::to_string(*viewState().primarySelection), std::to_string(*viewState().secondarySelection), "Text(strref)", locStrRefText(*stage, "Text")});
+                table.rows.push_back({"Entry", std::to_string(*viewState().primarySelection), std::to_string(*viewState().secondarySelection), "Text(lang0)", locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr)});
+            }
+        }
+        return table;
+    }
+
+    void applyTable(const neotabular::Table& table) {
+        const auto kindCol = requireColumn(table, "Kind");
+        const auto questCol = requireColumn(table, "QuestIndex");
+        const auto fieldCol = requireColumn(table, "Field");
+        const auto valueCol = requireColumn(table, "Value");
+        const auto entryCol = optionalColumn(table, "EntryIndex");
+        for (const auto& row : table.rows) {
+            const auto kind = lowerAscii(tableCell(row, kindCol));
+            const auto questText = tableCell(row, questCol);
+            if (questText.empty()) continue;
+            const auto questIndex = static_cast<std::size_t>(std::stoull(questText));
+            const auto fieldName = tableCell(row, fieldCol);
+            const auto value = tableCell(row, valueCol);
+            if (kind == "quest") {
+                gff().ChangeFieldValue(pathForQuest(questIndex, fieldName), value);
+            } else if (kind == "entry") {
+                const auto entryText = tableCell(row, entryCol);
+                if (entryText.empty()) continue;
+                const auto entryIndex = static_cast<std::size_t>(std::stoull(entryText));
+                gff().ChangeFieldValue(pathForStage(questIndex, entryIndex, fieldName), value);
+            }
+        }
+    }
+
+    void importFromPath(neotabular::Format format, const std::filesystem::path& file) {
+        try {
+            ensureLoaded();
+            if (format == neotabular::Format::Xml) {
+                LoadGffXml(gff(), readTextFile(file));
+            } else if (format == neotabular::Format::Json) {
+                LoadGffXml(gff(), gffJsonToXml(readTextFile(file)));
+            } else {
+                throw std::runtime_error("NeoJRL imports only semantic XML or JSON. CSV/TSV flattened import is not supported for JRL/GFF files.");
+            }
+            authoringFlavor() = detectJournalFlavor(gff());
+            viewState().resetForNewDocument();
+            entryViewState().resetForNewDocument();
+            if (searchText_) searchText_->ChangeValue("");
+            refreshQuests();
+            setModuleStatusText(wxui::toWx("Imported " + file.string()), 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onImport(neotabular::Format format) {
+#if defined(__EMSCRIPTEN__)
+        if (!hasActiveDocument()) return;
+        wxWindow* const targetPage = activeDocument().tabPage;
+        requestBrowserImport(
+            "Import " + neotabular::formatName(format),
+            format == neotabular::Format::Xml ? ".xml" : ".json",
+            false,
+            [this, targetPage, format](neobrowser::BrowserImportLease import) {
+                if (import.empty() || IsBeingDeleted()) return;
+                if (!hasActiveDocument() || activeDocument().tabPage != targetPage) {
+                    wxui::showMessage(
+                        this,
+                        "Import Cancelled",
+                        "The active document changed while the import picker was open. Start the import again from the intended tab.");
+                    return;
+                }
+                importFromPath(format, import.paths().front());
+            });
+#else
+        try {
+            const auto file = wxui::chooseOpenFile(
+                this,
+                "Import " + neotabular::formatName(format),
+                tableWildcardForFormat(format));
+            if (!file) return;
+            importFromPath(format, *file);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+#endif
+    }
+
+    void onExport(neotabular::Format format) {
+        try {
+            ensureLoaded();
+            const auto file = wxui::chooseSaveFile(this, "Export " + neotabular::formatName(format), tableWildcardForFormat(format),
+                                                  exportDefaultFilename(documentFilename(activeDocument()), format, "global"));
+            if (!file) return;
+            if (format == neotabular::Format::Xml || format == neotabular::Format::Json) {
+                if (neoview::hasAnyFilter(viewState()) || neoview::hasAnyFilter(entryViewState())) {
+                    throw std::runtime_error("Semantic JRL XML/JSON export preserves hierarchy and does not support row filtering. Clear quest and entry filters first.");
+                }
+                const std::string xml = ToGffXml(gff());
+                checkOutput(*file, true);
+                writeTextFile(*file, format == neotabular::Format::Json ? gffXmlToJson(xml) : xml);
+            } else {
+                throw std::runtime_error("NeoJRL exports only semantic XML or JSON. CSV/TSV flattened export is not supported for JRL/GFF files.");
+            }
+            setModuleStatusText(wxui::toWx("Exported " + file->string()), 1);
+        } catch (const std::exception& ex) { wxui::showError(this, ex); }
+    }
+
+    void exportPatcherFromOriginal(const std::filesystem::path& originalPath) {
+        try {
+            ensureLoaded();
+            requireJrlPatcherDocument(gff(), "The active document");
+
+            GffFile original;
+            original.LoadFile(originalPath);
+            requireMatchingJrlPatcherDocuments(original, gff());
+
+            std::string defaultPatchName = documentFilename(activeDocument()).filename().string();
+            if (defaultPatchName.empty()) defaultPatchName = "global.jrl";
+            const auto patchName = wxui::promptText(
+                this,
+                "Patch Target Filename",
+                "JRL filename to patch in the user's install:",
+                defaultPatchName);
+            if (!patchName || patchName->empty()) return;
+
+            const auto output = wxui::choosePatcherOutput(this);
+            if (!output) return;
+            const bool writeToIni = output->writesToIni();
+
+            auto project = neotsl::diffGffFlatTable(
+                jrlTableForPatcher(original),
+                jrlTableForPatcher(gff()),
+                *patchName,
+                writeToIni,
+                originalPath);
+            neotsl::throwIfUnsupported(project);
+
+            if (!writeToIni) {
+                wxui::showIniFragmentDialog(
+                    this,
+                    "JRL Patcher INI Fragment",
+                    project,
+                    {*patchName});
+                return;
+            }
+
+            const auto report = neotsl::writePackageToIni(project, output->iniPath, true);
+            wxui::showMessage(
+                this,
+                "TSL/HoloPatcher JRL Package",
+                std::string(report.mergedExisting ? "Merged the generated JRL instructions into:\n"
+                                                  : "Created the installer INI:\n") +
+                    neosettings::pathToUtf8(report.iniPath) +
+                    "\n\nThe clean JRL baseline was staged beside the selected INI.");
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onExportPatcher() {
+        try {
+            ensureLoaded();
+            requireJrlPatcherDocument(gff(), "The active document");
+#if defined(__EMSCRIPTEN__)
+            wxWindow* const targetPage = activeDocument().tabPage;
+            requestBrowserImport(
+                "Select clean/unmodified global.jrl",
+                ".jrl",
+                false,
+                [this, targetPage](neobrowser::BrowserImportLease import) {
+                    if (import.empty() || IsBeingDeleted()) return;
+                    if (!hasActiveDocument() || activeDocument().tabPage != targetPage) {
+                        wxui::showMessage(
+                            this,
+                            "Patcher Export Cancelled",
+                            "The active document changed while the baseline picker was open. Start the export again from the intended tab.");
+                        return;
+                    }
+                    exportPatcherFromOriginal(import.paths().front());
+                });
+#else
+            const auto originalPath = wxui::chooseOpenFile(
+                this,
+                "Select clean/unmodified global.jrl",
+                kJRLWildcard);
+            if (!originalPath) return;
+            exportPatcherFromOriginal(*originalPath);
+#endif
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onCopyCells(wxCommandEvent&) {
+        try {
+            auto table = selectedTable();
+            if (table.rows.empty()) return;
+            if (wxTheClipboard->Open()) {
+                wxTheClipboard->SetData(new wxTextDataObject(wxui::toWx(neotabular::serializeDelimited(table, '\t'))));
+                wxTheClipboard->Close();
+            }
+        } catch (const std::exception& ex) { wxui::showError(this, ex); }
+    }
+
+    void onPasteCells(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            if (!wxTheClipboard->Open()) return;
+            wxTextDataObject data;
+            const bool ok = wxTheClipboard->GetData(data);
+            wxTheClipboard->Close();
+            if (!ok) return;
+            applyTable(neotabular::parseDelimited(wxui::toStd(data.GetText()), '\t'));
+            refreshQuests();
+        } catch (const std::exception& ex) { wxui::showError(this, ex); }
+    }
+
+    void chooseAndOpenJrl(const std::filesystem::path& initialDirectory = {}) {
+#if defined(__EMSCRIPTEN__)
+        (void)initialDirectory;
+        requestBrowserImport(
+            "Please select a global.jrl file to open.",
+            ".jrl",
+            false,
+            [this](neobrowser::BrowserImportLease import) {
+                if (import.empty() || IsBeingDeleted()) return;
+                try {
+                    const std::filesystem::path selected = import.paths().front();
+                    openJrlPath(selected, std::move(import));
+                } catch (const std::exception& ex) {
+                    wxui::showError(this, ex);
+                }
+            });
+#else
+        try {
+            const auto file = wxui::chooseOpenFile(
+                this,
+                "Please select a global.jrl file to open.",
+                kJRLWildcard,
+                initialDirectory);
+            if (!file) return;
+            openJrlPath(*file);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+#endif
+    }
+
+    void onOpen(wxCommandEvent&) {
+        chooseAndOpenJrl();
+    }
+
+    void tryLoadCachedTlk() {
+        if (tlk().has_value()) return;
+#if defined(__EMSCRIPTEN__)
+        // Browser imports are process-local and cannot be reopened after a
+        // page reload. Discard any stale cached virtual path.
+        neosettings::AppSettings(kAppName).clearLastTlkPath();
+        return;
+#else
+        const auto cached = readCachedTlkPath();
+        if (!cached || cached->empty()) return;
+        try {
+            if (!std::filesystem::exists(*cached)) {
+                tlkAutoLoadWarning() = "Cached TLK not found: " + cached->string();
+                return;
+            }
+            tlk().emplace();
+            tlk()->load(*cached);
+            tlkPath() = *cached;
+            tlkAutoLoadWarning().clear();
+        } catch (const std::exception& ex) {
+            tlkAutoLoadWarning() = std::string("Unable to auto-load cached TLK: ") + ex.what();
+        }
+#endif
+    }
+
+    void loadTlkFromPath(const std::filesystem::path& file, bool rememberPath = true) {
+        try {
+            tlk().emplace();
+            tlk()->load(file);
+            tlkPath() = file;
+            if (rememberPath) writeCachedTlkPath(file);
+            else neosettings::AppSettings(kAppName).clearLastTlkPath();
+            tlkAutoLoadWarning().clear();
+            refreshQuests();
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onLoadTlk(wxCommandEvent&) {
+#if defined(__EMSCRIPTEN__)
+        if (!hasActiveDocument()) return;
+        wxWindow* const targetPage = activeDocument().tabPage;
+        requestBrowserImport(
+            "Load dialog.tlk for optional resolved text",
+            ".tlk",
+            false,
+            [this, targetPage](neobrowser::BrowserImportLease import) {
+                if (import.empty() || IsBeingDeleted()) return;
+                if (!hasActiveDocument() || activeDocument().tabPage != targetPage) {
+                    wxui::showMessage(
+                        this,
+                        "TLK Load Cancelled",
+                        "The active document changed while the TLK picker was open. Select the TLK again from the intended tab.");
+                    return;
+                }
+                // TlkLookup owns all decoded data after load; release this
+                // one-shot import when the callback returns.
+                loadTlkFromPath(import.paths().front(), false);
+            });
+#else
+        const auto file = wxui::chooseOpenFile(
+            this,
+            "Load dialog.tlk for optional resolved text",
+            kTlkWildcard);
+        if (!file) return;
+        loadTlkFromPath(*file);
+#endif
+    }
+
+    bool saveTo(const std::filesystem::path& target) {
+        if (target.empty() || !hasActiveDocument() || !gff().loaded()) return false;
+        if (activeDocument().saveInProgress || browserSaveActive_) return false;
+
+        DocumentTab& document = activeDocument();
+        checkDestination(target);
+#if defined(__EMSCRIPTEN__)
+        const bool wasDirty = document.gff->dirty();
+#endif
+        document.gff->SaveFile(target);
+
+#if defined(__EMSCRIPTEN__)
+        document.saveInProgress = true;
+        browserSaveActive_ = true;
+        updateDocumentTabTitle(document);
+        refreshQuests();
+        Enable(false);
+
+        wxWeakRef<NeoJRLPanelImpl> weakSelf(this);
+        wxWindow* const targetPage = document.tabPage;
+        neobrowser::requestDownloadFile(
+            target,
+            target.filename().string(),
+            [weakSelf, targetPage, target, wasDirty](neobrowser::DownloadResult result) {
+                if (!weakSelf || weakSelf->IsBeingDeleted()) return;
+                auto* const frame = weakSelf.get();
+                frame->browserSaveActive_ = false;
+                frame->Enable(true);
+
+                const std::size_t index = neotabs::findDocumentIndexForPage(
+                    frame->documents_, targetPage);
+                if (index == neotabs::npos) return;
+
+                DocumentTab& savedDocument = frame->documents_[index];
+                savedDocument.saveInProgress = false;
+                if (!result.error.empty() || result.cancelled()) {
+                    savedDocument.gff->dirty(wasDirty);
+                    frame->updateDocumentTabTitle(savedDocument);
+                    if (index == frame->activeDocumentIndex_) frame->refreshQuests();
+                    const std::string message = result.error.empty()
+                        ? "The browser save transaction was cancelled."
+                        : result.error;
+                    wxMessageBox(wxui::toWx(message), "Save Failed",
+                                 wxOK | wxICON_ERROR, frame);
+                    return;
+                }
+
+                if (result.ready()) {
+                    savedDocument.gff->dirty(wasDirty);
+                    frame->updateDocumentTabTitle(savedDocument);
+                    if (index == frame->activeDocumentIndex_) frame->refreshQuests();
+                    wxui::showMessage(
+                        frame,
+                        "Replacement download ready",
+                        "The browser could not overwrite the original host file directly. "
+                        "A replacement JRL is ready in the download panel. The tab remains marked modified. "
+                        "Download the replacement, then close the tab only after confirming that you retained it.");
+                    return;
+                }
+
+                if (!result.saved()) {
+                    savedDocument.gff->dirty(wasDirty);
+                    frame->updateDocumentTabTitle(savedDocument);
+                    if (index == frame->activeDocumentIndex_) frame->refreshQuests();
+                    wxMessageBox(
+                        "The browser did not confirm that the JRL was written.",
+                        "Save Failed", wxOK | wxICON_ERROR, frame);
+                    return;
+                }
+
+                savedDocument.logicalFilename = target;
+                savedDocument.gff->dirty(false);
+                const JournalFlavor detected = detectJournalFlavor(*savedDocument.gff);
+                if (detected != JournalFlavor::Unknown) {
+                    savedDocument.authoringFlavor = detected;
+                }
+                if (!frame->importOwnsPath(savedDocument.sourceImport, target)) {
+                    savedDocument.sourceImport.reset();
+                }
+                frame->rememberRecentFile(target);
+                neogames::resolver().inferFromOpenedPath(target);
+                frame->updateDocumentTabTitle(savedDocument);
+                if (index == frame->activeDocumentIndex_) frame->refreshQuests();
+            });
+        return true;
+#else
+        document.logicalFilename = target;
+        document.gff->dirty(false);
+        const JournalFlavor detected = detectJournalFlavor(*document.gff);
+        if (detected != JournalFlavor::Unknown) document.authoringFlavor = detected;
+        rememberRecentFile(target);
+        neogames::resolver().inferFromOpenedPath(target);
+        refreshQuests();
+        return true;
+#endif
+    }
+
+    bool saveAsInteractive() {
+        const std::filesystem::path current = documentFilename(activeDocument());
+        const std::string defaultName = current.empty()
+            ? (activeDocument().resourceIdentity.empty() ? defaultJournalFilename() : activeDocument().untitledName)
+            : current.filename().string();
+        const auto file = wxui::chooseSaveFile(
+            this, "Save journal as", kJRLWildcard, defaultName);
+        return file && saveTo(*file);
+    }
+
+    void onSave(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            const std::filesystem::path target = documentFilename(activeDocument());
+            if (target.empty()) {
+                (void)saveAsInteractive();
+                return;
+            }
+            (void)saveTo(target);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onSaveAs(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            (void)saveAsInteractive();
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onNewQuest(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            const auto flavor = flavorForNewQuest();
+            if (!flavor) return;
+
+            const bool clearedQuestFilters = neoview::hasAnyFilter(viewState());
+            if (clearedQuestFilters) neoview::clearAllFilters(viewState());
+            neoview::clearAllFilters(entryViewState());
+
+            const auto added = appendJournalQuest(gff(), *flavor);
+            if (authoringFlavor() == JournalFlavor::Unknown) {
+                authoringFlavor() = *flavor;
+            }
+
+            refreshQuests();
+            selectQuestIndex(added.index);
+            loadSelectedQuest();
+            updateActiveTabTitle();
+            if (tag_ != nullptr) {
+                tag_->SetFocus();
+                tag_->SelectAll();
+            }
+
+            std::string status = "Added " + std::string(journalFlavorDisplayName(*flavor)) +
+                                 " quest '" + added.tag + "'.";
+            if (clearedQuestFilters) {
+                status += " Quest filters were cleared so the new quest is visible.";
+            }
+            status += " Add its first journal entry when ready.";
+            setModuleStatusText(wxui::toWx(status), 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onDeleteQuest(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            const long row = wxui::selectedRow(*questList_);
+            if (row < 0) throw std::runtime_error("Select a quest to delete.");
+
+            const std::size_t questIndex = static_cast<std::size_t>(questList_->GetItemData(row));
+            const auto& categories = requireCategories(gff());
+            const GffStruct* quest = categories.GetStruct(questIndex);
+            if (quest == nullptr) throw std::runtime_error("The selected quest no longer exists.");
+
+            const std::string tag = fieldText(*quest, "Tag");
+            std::string name = locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr);
+            if (name.empty()) name = "(unnamed quest)";
+            const GffList* entries = questEntries(*quest);
+            const std::size_t entryCount = entries == nullptr ? 0 : entries->count();
+
+            std::string message = "Delete quest '" + name + "'";
+            if (!tag.empty()) message += " (tag: " + tag + ")";
+            message += " and all " + std::to_string(entryCount) +
+                       (entryCount == 1 ? " journal entry" : " journal entries") +
+                       "?\n\nThis changes the JRL structure and cannot be undone.";
+            if (!wxui::confirm(this, "Delete Quest", message)) return;
+
+            const JournalFlavor priorFlavor = detectJournalFlavor(gff());
+            const auto nextSelection = deleteJournalQuest(gff(), questIndex);
+            const JournalFlavor remainingFlavor = detectJournalFlavor(gff());
+            if (remainingFlavor == JournalFlavor::Kotor ||
+                remainingFlavor == JournalFlavor::NeverwinterNights) {
+                authoringFlavor() = remainingFlavor;
+            } else if (!nextSelection &&
+                       (priorFlavor == JournalFlavor::Kotor ||
+                        priorFlavor == JournalFlavor::NeverwinterNights)) {
+                authoringFlavor() = priorFlavor;
+            }
+
+            refreshQuests();
+            if (nextSelection) {
+                selectQuestIndex(*nextSelection);
+                loadSelectedQuest();
+            } else {
+                clearQuestPanel();
+                clearEntryPanel();
+            }
+            updateActiveTabTitle();
+            setModuleStatusText("Quest deleted.", 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onApplyQuest(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            const long row = wxui::selectedRow(*questList_);
+            if (row < 0) throw std::runtime_error("Select a quest first.");
+            const auto index = static_cast<std::size_t>(questList_->GetItemData(row));
+            JournalFlavor flavor = detectJournalQuestFlavor(gff(), index);
+            if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
+
+            const UInt32 nameStrRef = parseRequiredStrRef(*nameStrRef_, "Name StrRef");
+            setJournalQuestLocalizedString(
+                gff(), index, "Name", nameStrRef,
+                nameStrRef == kNoStrRef ? std::optional<std::string>{wxui::toStd(name_->GetValue())}
+                                        : std::nullopt);
+            changeJournalQuestTag(gff(), index, wxui::toStd(tag_->GetValue()));
+            setJournalQuestOptionalString(gff(), index, "Comment", optionalText(*comment_));
+            setJournalQuestOptionalDword(gff(), index, "Priority", parseOptionalDword(*priority_, "Sort priority"));
+            setJournalQuestOptionalWord(gff(), index, "Picture", parseOptionalWord(*picture_, "Journal picture ID"));
+
+            if (flavor != JournalFlavor::NeverwinterNights) {
+                setJournalQuestOptionalInt(gff(), index, "PlanetID", parseOptionalInt32(*planet_, "Planet ID"));
+                setJournalQuestOptionalInt(gff(), index, "PlotIndex", parseOptionalInt32(*plotIndex_, "PlotXP.2da row"));
+            }
+            if (flavor != JournalFlavor::Kotor) {
+                setJournalQuestOptionalDword(gff(), index, "XP", parseOptionalDword(*questXp_, "Quest XP"));
+            }
+
+            refreshQuests();
+            selectQuestIndex(index);
+            loadSelectedQuest();
+            updateActiveTabTitle();
+            setModuleStatusText("Quest changes applied.", 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onApplyEntry(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            if (!viewState().primarySelection) throw std::runtime_error("Select a quest first.");
+            const long row = wxui::selectedRow(*entryList_);
+            if (row < 0) throw std::runtime_error("Select an entry first.");
+            const auto questIndex = *viewState().primarySelection;
+            const auto entryIndex = static_cast<std::size_t>(entryList_->GetItemData(row));
+            JournalFlavor flavor = detectJournalQuestFlavor(gff(), questIndex);
+            if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
+
+            changeJournalEntryId(gff(), questIndex, entryIndex,
+                                 parseRequiredDword(*entryId_, "Entry ID"));
+            setJournalEntryWord(gff(), questIndex, entryIndex, "End", entryEnd_->GetValue() ? 1u : 0u);
+            if (flavor != JournalFlavor::NeverwinterNights) {
+                setJournalEntryOptionalFloat(gff(), questIndex, entryIndex, "XP_Percentage",
+                                             parseOptionalFloat(*entryXp_, "Plot XP multiplier"));
+            }
+
+            const UInt32 textStrRef = parseRequiredStrRef(*entryStrRef_, "Entry StrRef");
+            setJournalEntryLocalizedString(
+                gff(), questIndex, entryIndex, "Text", textStrRef,
+                textStrRef == kNoStrRef ? std::optional<std::string>{wxui::toStd(entryText_->GetValue())}
+                                        : std::nullopt);
+
+            refreshEntries(questIndex);
+            selectEntryIndex(entryIndex);
+            loadSelectedEntry();
+            updateActiveTabTitle();
+            setModuleStatusText("Entry changes applied.", 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onNewEntry(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            if (!viewState().primarySelection) {
+                throw std::runtime_error("Select a quest before adding an entry.");
+            }
+
+            const std::size_t questIndex = *viewState().primarySelection;
+            const bool clearedEntryFilters = neoview::hasAnyFilter(entryViewState());
+            const auto added = appendJournalEntry(gff(), questIndex);
+            if (clearedEntryFilters) {
+                neoview::clearAllFilters(entryViewState());
+            }
+            refreshEntries(questIndex);
+            selectEntryIndex(added.index);
+            loadSelectedEntry();
+            updateActiveTabTitle();
+            if (entryId_ != nullptr) entryId_->SetFocus();
+
+            std::string status = "Added journal entry ID " + std::to_string(added.entryId) + ".";
+            if (clearedEntryFilters) status += " Entry filters were cleared so the new entry is visible.";
+            setModuleStatusText(wxui::toWx(status), 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void onDeleteEntry(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            if (!viewState().primarySelection) {
+                throw std::runtime_error("Select a quest before deleting an entry.");
+            }
+            const long row = wxui::selectedRow(*entryList_);
+            if (row < 0) {
+                throw std::runtime_error("Select an entry to delete.");
+            }
+
+            const std::size_t questIndex = *viewState().primarySelection;
+            const std::size_t entryIndex = static_cast<std::size_t>(entryList_->GetItemData(row));
+            const GffStruct* entry = selectedEntry(entryIndex);
+            if (entry == nullptr) {
+                throw std::runtime_error("The selected entry no longer exists.");
+            }
+            const std::string entryId = fieldText(*entry, "ID");
+            const std::string description = entryId.empty()
+                ? "entry at list index " + std::to_string(entryIndex)
+                : "entry ID " + entryId;
+            if (!wxui::confirm(this,
+                               "Delete Entry",
+                               "Delete " + description + " from the selected quest?\n\nThis changes the JRL structure and cannot be undone.")) {
+                return;
+            }
+
+            const auto nextSelection = deleteJournalEntry(gff(), questIndex, entryIndex);
+            refreshEntries(questIndex);
+            if (nextSelection) {
+                selectEntryIndex(*nextSelection);
+                loadSelectedEntry();
+            } else {
+                clearEntryPanel();
+            }
+            updateActiveTabTitle();
+            setModuleStatusText(wxui::toWx("Deleted " + description + "."), 1);
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void applyDarkMode() {
+        if (darkModeItem_ != nullptr) {
+            darkModeItem_->Check(darkMode_);
+        }
+        wxui::applyTheme(this, darkMode_);
+        if (questList_ != nullptr) {
+            wxui::applyListTheme(*questList_, darkMode_);
+        }
+        if (entryList_ != nullptr) {
+            wxui::applyListTheme(*entryList_, darkMode_);
+        }
+        applyFontScale();
+    }
+
+    void applyFontScale() {
+        neoview::applyFontScale(this, fontScale_);
+    }
+
+    void changeFontScaleSteps(int steps) {
+        const double next = neoview::steppedFontScale(fontScale_, steps);
+        if (neoview::fontScalePercent(next) == neoview::fontScalePercent(fontScale_)) return;
+        fontScale_ = next;
+        settings_.setFontScale(fontScale_);
+        applyFontScale();
+    }
+
+    void onToggleDarkMode(wxCommandEvent& event) {
+        darkMode_ = event.IsChecked();
+        wxui::writeDarkMode(kAppName, darkMode_);
+        applyDarkMode();
+    }
+
+    void onIncreaseFontScale(wxCommandEvent&) {
+        fontScaleWheelFilter_.reset();
+        changeFontScaleSteps(1);
+    }
+    void onDecreaseFontScale(wxCommandEvent&) {
+        fontScaleWheelFilter_.reset();
+        changeFontScaleSteps(-1);
+    }
+    void onResetFontScale(wxCommandEvent&) {
+        fontScaleWheelFilter_.reset();
+        fontScale_ = neoview::kDefaultFontScale;
+        settings_.setFontScale(fontScale_);
+        applyFontScale();
+    }
+
+
+
+    void onApplySearchFilter(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            const std::string text = searchText_ ? wxui::toStd(searchText_->GetValue()) : std::string();
+            if (text.empty()) {
+                throw std::runtime_error("Enter search text before applying it as a filter.");
+            }
+            viewState().filterTerm = text;
+            viewState().sortColumn = searchMode_ ? searchMode_->GetSelection() : 0;
+            refreshQuests();
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    void clearAllFiltersAndRefresh() {
+        neoview::clearAllFilters(viewState());
+        neoview::clearAllFilters(entryViewState());
+        if (gff().loaded()) {
+            refreshQuests();
+        } else {
+            updateQuestColumnLabels();
+            updateEntryColumnLabels();
+        }
+    }
+
+    void onClearFilter(wxCommandEvent&) { clearAllFiltersAndRefresh(); }
+    void onClearAllFilters(wxCommandEvent&) { clearAllFiltersAndRefresh(); }
+
+    void promptColumnFilter(bool entryList, int visualColumn) {
+        ensureLoaded();
+        auto& state = entryList ? entryViewState() : viewState();
+        neoview::ensureIdentityColumns(state, 2);
+        const std::size_t logicalColumn = neoview::logicalColumnForVisual(state, static_cast<std::size_t>(std::max(0, visualColumn)));
+        const auto* existing = neoview::findColumnFilter(state, logicalColumn);
+        const std::string prior = existing != nullptr ? existing->term : std::string();
+        const std::string label = entryList ? entryColumnLabel(logicalColumn) : questColumnLabel(logicalColumn);
+        const auto term = wxui::promptText(this, entryList ? "Entry Column Filter" : "Quest Column Filter", "Show rows where " + label + " contains:", prior);
+        if (!term) return;
+        if (neoview::trimmedCopy(*term).empty()) {
+            neoview::clearColumnFilter(state, logicalColumn);
+        } else {
+            neoview::setColumnFilter(state, neoview::ColumnFilter{logicalColumn, label, *term, neoview::TextFilterMode::Contains, true});
+        }
+        if (entryList && viewState().primarySelection) {
+            refreshEntries(*viewState().primarySelection);
+        } else {
+            refreshQuests();
+        }
+    }
+
+    void onFilterSelectedColumn(wxCommandEvent&) {
+        try { promptColumnFilter(contextListIsEntry_, contextVisualColumn_); } catch (const std::exception& ex) { wxui::showError(this, ex); }
+    }
+
+    void onClearSelectedColumnFilter(wxCommandEvent&) {
+        auto& state = contextListIsEntry_ ? entryViewState() : viewState();
+        neoview::ensureIdentityColumns(state, 2);
+        const std::size_t logicalColumn = neoview::logicalColumnForVisual(state, static_cast<std::size_t>(std::max(0, contextVisualColumn_)));
+        neoview::clearColumnFilter(state, logicalColumn);
+        if (contextListIsEntry_ && viewState().primarySelection) {
+            refreshEntries(*viewState().primarySelection);
+        } else {
+            refreshQuests();
+        }
+    }
+
+    void onResetColumnOrder(wxCommandEvent&) {
+        neoview::setIdentityColumns(viewState(), 2);
+        neoview::setIdentityColumns(entryViewState(), 2);
+        if (gff().loaded()) refreshQuests(); else { updateQuestColumnLabels(); updateEntryColumnLabels(); }
+    }
+
+    void onResetRowOrder(wxCommandEvent&) {
+        if (gff().loaded()) refreshQuests();
+    }
+
+    void onQuestColumnRightClick(wxListEvent& event) {
+        contextListIsEntry_ = false;
+        contextVisualColumn_ = event.GetColumn();
+        wxMenu menu;
+        menu.Append(ID_FilterColumn, "Filter This Quest Column...");
+        menu.Append(ID_ClearColumnFilter, "Clear Filter on This Quest Column");
+        menu.AppendSeparator();
+        menu.Append(ID_ClearAllFilters, "Clear All Filters");
+        PopupMenu(&menu);
+    }
+
+    void onEntryColumnRightClick(wxListEvent& event) {
+        contextListIsEntry_ = true;
+        contextVisualColumn_ = event.GetColumn();
+        wxMenu menu;
+        menu.Append(ID_FilterColumn, "Filter This Entry Column...");
+        menu.Append(ID_ClearColumnFilter, "Clear Filter on This Entry Column");
+        menu.AppendSeparator();
+        menu.Append(ID_ClearAllFilters, "Clear All Filters");
+        PopupMenu(&menu);
+    }
+
+    void onSearch(wxCommandEvent&) {
+        try {
+            ensureLoaded();
+            const std::string text = wxui::toStd(searchText_->GetValue());
+            if (text.empty()) {
+                throw std::runtime_error("Enter search text first.");
+            }
+            const int mode = searchMode_->GetSelection();
+            const auto startQuest = viewState().primarySelection.value_or(static_cast<std::size_t>(-1));
+            if (searchFrom(mode, text, startQuest + 1) || searchFrom(mode, text, 0, startQuest + 1)) {
+                return;
+            }
+            wxui::showMessage(this, "Search", "No results matching the specified criteria were found.");
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+        }
+    }
+
+    bool searchFrom(int mode, const std::string& text, std::size_t begin, std::optional<std::size_t> end = std::nullopt) {
+        const auto& categories = requireCategories(gff());
+        const std::size_t stop = std::min(end.value_or(categories.count()), categories.count());
+        for (std::size_t qi = begin; qi < stop; ++qi) {
+            const auto* quest = categories.GetStruct(qi);
+            if (quest == nullptr) {
+                continue;
+            }
+            if (matchesQuest(mode, *quest, text)) {
+                selectQuestIndex(qi);
+                loadSelectedQuest();
+                return true;
+            }
+            if (mode == 2) {
+                const auto* entries = questEntries(*quest);
+                if (entries == nullptr) {
+                    continue;
+                }
+                for (std::size_t si = 0; si < entries->count(); ++si) {
+                    const auto* stage = entries->GetStruct(si);
+                    if (stage != nullptr && containsInsensitive(locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr), text)) {
+                        selectQuestIndex(qi);
+                        loadSelectedQuest();
+                        selectEntryIndex(si);
+                        loadSelectedEntry();
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    bool matchesQuest(int mode, const GffStruct& quest, const std::string& text) const {
+        switch (mode) {
+            case 0: return containsInsensitive(fieldText(quest, "Tag"), text);
+            case 1: return containsInsensitive(locResolvedText(quest, "Name", tlk().has_value() ? &*tlk() : nullptr), text);
+            case 3: return containsInsensitive(fieldText(quest, "PlanetID"), text);
+            case 4: return containsInsensitive(fieldText(quest, "Priority"), text);
+            case 5: return containsInsensitive(fieldText(quest, "PlotIndex"), text);
+            case 6: return containsInsensitive(fieldText(quest, "Picture"), text);
+            case 7: return containsInsensitive(fieldText(quest, "XP"), text);
+            default: return false;
+        }
+    }
+
+    void onCloseTab(wxCommandEvent&) { closeDocumentTab(activeDocumentIndex_); }
+
+    void onCloseOtherTabs(wxCommandEvent&) {
+        if (!hasActiveDocument()) return;
+        for (std::size_t i = documents_.size(); i-- > 0;) {
+            if (i != activeDocumentIndex_ && !closeDocumentTab(i)) return;
+        }
+    }
+
+    void onNextTab(wxCommandEvent&) {
+        if (documentTabs_ == nullptr || documentTabs_->GetPageCount() < 2) return;
+        tabSwitchInProgress_ = true;
+        documentTabs_->AdvanceSelection(true);
+        tabSwitchInProgress_ = false;
+        const std::size_t index = neotabs::findDocumentIndexForPage(
+            documents_, neotabs::currentPage(documentTabs_));
+        if (index != neotabs::npos) selectDocumentTab(index);
+    }
+
+    void onPreviousTab(wxCommandEvent&) {
+        if (documentTabs_ == nullptr || documentTabs_->GetPageCount() < 2) return;
+        tabSwitchInProgress_ = true;
+        documentTabs_->AdvanceSelection(false);
+        tabSwitchInProgress_ = false;
+        const std::size_t index = neotabs::findDocumentIndexForPage(
+            documents_, neotabs::currentPage(documentTabs_));
+        if (index != neotabs::npos) selectDocumentTab(index);
+    }
+
+
+
+    neosettings::AppSettings settings_{kAppName};
+    wxMenu* recentFilesMenu_ = nullptr;
+    wxMenuItem* darkModeItem_ = nullptr;
+    wxListCtrl* questList_ = nullptr;
+    wxListCtrl* entryList_ = nullptr;
+    wxChoice* searchMode_ = nullptr;
+    wxTextCtrl* searchText_ = nullptr;
+    wxTextCtrl* filePath_ = nullptr;
+    wxTextCtrl* tlkPathText_ = nullptr;
+    wxStaticText* profileLabel_ = nullptr;
+    wxTextCtrl* profile_ = nullptr;
+    wxTextCtrl* nameStrRef_ = nullptr;
+    wxTextCtrl* name_ = nullptr;
+    wxTextCtrl* comment_ = nullptr;
+    wxTextCtrl* tag_ = nullptr;
+    wxStaticText* planetLabel_ = nullptr;
+    wxTextCtrl* planet_ = nullptr;
+    wxTextCtrl* priority_ = nullptr;
+    wxTextCtrl* picture_ = nullptr;
+    wxStaticText* plotIndexLabel_ = nullptr;
+    wxTextCtrl* plotIndex_ = nullptr;
+    wxStaticText* questXpLabel_ = nullptr;
+    wxTextCtrl* questXp_ = nullptr;
+    wxTextCtrl* entryId_ = nullptr;
+    wxStaticText* entryXpLabel_ = nullptr;
+    wxTextCtrl* entryXp_ = nullptr;
+    wxCheckBox* entryEnd_ = nullptr;
+    wxTextCtrl* entryStrRef_ = nullptr;
+    wxTextCtrl* entryText_ = nullptr;
+    wxAuiNotebook* documentTabs_ = nullptr;
+    std::vector<DocumentTab> documents_;
+    std::size_t activeDocumentIndex_ = neotabs::npos;
+    bool tabSwitchInProgress_ = false;
+    int contextVisualColumn_ = 0;
+    bool contextListIsEntry_ = false;
+    bool browserSaveActive_ = false;
+    neoview::FontScaleWheelFilter fontScaleWheelFilter_;
+    double fontScale_ = neoview::kDefaultFontScale;
+    bool darkMode_ = false;
+};
+
+
+} // namespace
+
+namespace neojrl::ui {
+JRLEditorPanel* createEditorPanel(wxWindow* parent, neomodules::Context context) {
+    return new NeoJRLPanelImpl(parent, std::move(context));
+}
+}
