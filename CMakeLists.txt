@@ -75,6 +75,12 @@ target_compile_features(neojrl_core PUBLIC cxx_std_17)
 option(NEOJRL_BUILD_CLI "Build the NeoJRL CLI" ON)
 if(NEOJRL_BUILD_CLI)
     add_executable(neojrl-cli src/CliMain.cpp)
+    neo_add_windows_version_resource(neojrl-cli
+        VERSION "${PROJECT_VERSION}"
+        PRODUCT_NAME "NeoJRL"
+        FILE_DESCRIPTION "NeoJRL command-line journal editor"
+        INTERNAL_NAME "neojrl-cli"
+        ORIGINAL_FILENAME "neojrl-cli.exe")
     target_link_libraries(neojrl-cli PRIVATE neojrl_core)
 endif()
 
@@ -155,21 +161,19 @@ if(NEOJRL_BUILD_WX_GUI OR NEOJRL_BUILD_WX_MODULE)
         if(NEOJRL_BUILD_WX_GUI)
         set(NEOJRL_WX_SOURCES src/wx/main.cpp)
         if(WIN32)
-            neo_configure_windows_version_resource(
-                NEOJRL_WX_SOURCES_RC
-                "${CMAKE_CURRENT_SOURCE_DIR}/resources/neojrl.rc.in"
-                "neojrl.rc"
-                "${CMAKE_CURRENT_SOURCE_DIR}/resources/neojrl.ico")
-            list(APPEND NEOJRL_WX_SOURCES "${NEOJRL_WX_SOURCES_RC}")
-        endif()
-
-        if(WIN32)
             add_executable(NeoJRL WIN32 ${NEOJRL_WX_SOURCES})
         elseif(APPLE)
             add_executable(NeoJRL MACOSX_BUNDLE ${NEOJRL_WX_SOURCES})
         else()
             add_executable(NeoJRL ${NEOJRL_WX_SOURCES})
         endif()
+        neo_add_windows_version_resource(NeoJRL
+            VERSION "${PROJECT_VERSION}"
+            PRODUCT_NAME "NeoJRL"
+            FILE_DESCRIPTION "NeoJRL journal editor"
+            INTERNAL_NAME "NeoJRL"
+            ORIGINAL_FILENAME "NeoJRL.exe"
+            ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/neojrl.ico")
         neo_configure_macos_bundle(NeoJRL
             NAME "NeoJRL"
             IDENTIFIER "com.vrifftech.neojrl"
