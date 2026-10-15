@@ -253,14 +253,12 @@ int exportGff(const std::filesystem::path& input, const std::string& formatText,
     return 0;
 }
 
-int importGff(const std::filesystem::path& input, const std::filesystem::path& output, const std::string& formatText, const std::filesystem::path& tablePath) {
+int importGff(const std::filesystem::path& output, const std::string& formatText, const std::filesystem::path& tablePath) {
     GffFile gff;
     const auto format = neotabular::parseFormat(formatText);
     if (format == neotabular::Format::Xml) {
-        (void)input;
         LoadGffXml(gff, readTextFile(tablePath));
     } else if (format == neotabular::Format::Json) {
-        (void)input;
         LoadGffXml(gff, gffJsonToXml(readTextFile(tablePath)));
     } else {
         throw std::runtime_error("NeoJRL imports only semantic XML or JSON. CSV/TSV flattened import is not supported for JRL/GFF files.");
@@ -372,7 +370,7 @@ void printUsage() {
               << "  neojrl-cli --roundtrip <global.jrl> <output.jrl>\n"
               << "  neojrl-cli --search <global.jrl> <term>\n"
               << "  neojrl-cli --export <global.jrl> <xml|json> <output>\n"
-              << "  neojrl-cli --import-values <input.jrl> <output.jrl> <xml|json> <input-document>\n"
+              << "  neojrl-cli import <output.jrl> <xml|json> <input-document>\n"
               << "  neojrl-cli --diff-tslpatcher <original.jrl> <modified-input> <output-dir|fragment.ini> [--modified-format xml|json|jrl|gff|kotor|native|auto] [--package|--fragment] [--filename name] [--ini installer.ini] [--allow-unsupported]\n"
               << "  neojrl-cli --diff-tslpatcher-import <original.jrl> <modified-input> <xml|json|jrl|gff|kotor|native|auto> <output-dir|fragment.ini> [--package|--fragment] [--filename name] [--ini installer.ini] [--allow-unsupported]\n\n"
               << "Prints, inspects, rewrites, searches, imports, or exports a canonical GFF V3.2 journal file.\n";
@@ -441,12 +439,12 @@ int main(int argc, char** argv) {
             return diffTslPatcher(argv[2], argv[3], argv[4], options);
         }
 
-        if (argc >= 2 && std::string(argv[1]) == "--import-values") {
-            if (argc != 6) {
+        if (argc >= 2 && std::string(argv[1]) == "import") {
+            if (argc != 5) {
                 printUsage();
                 return 2;
             }
-            return importGff(argv[2], argv[3], argv[4], argv[5]);
+            return importGff(argv[2], argv[3], argv[4]);
         }
 
         if (argc < 2 || argc > 3) {

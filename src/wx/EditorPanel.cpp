@@ -778,14 +778,22 @@ private:
     }
 
     void tryLoadResolvedTlkForPath(const std::filesystem::path& path) {
-        if (tlk().has_value()) return;
-        const auto resolvedTlkPath = neogames::resolver().bestTlkForPath(path);
-        if (!resolvedTlkPath || resolvedTlkPath->empty()) return;
+        neogames::ResourceGameContext context;
+        context.compatibleGames = {neogames::GameId::Kotor1, neogames::GameId::Kotor2};
+        const auto resolution = neogames::resolver().resolveContext(path, context);
+        if (resolution.tlkPath.empty()) {
+            if (resolution.ambiguous) tlkAutoLoadWarning() = resolution.diagnostic;
+            return;
+        }
+        if (tlk().has_value() && neosettings::samePathForMru(tlkPath(), resolution.tlkPath)) {
+            tlkAutoLoadWarning().clear();
+            return;
+        }
         try {
             tlk().emplace();
-            tlk()->load(*resolvedTlkPath);
-            tlkPath() = *resolvedTlkPath;
-            writeCachedTlkPath(*resolvedTlkPath);
+            tlk()->load(resolution.tlkPath);
+            tlkPath() = resolution.tlkPath;
+            writeCachedTlkPath(resolution.tlkPath);
             tlkAutoLoadWarning().clear();
         } catch (const std::exception& ex) {
             tlkAutoLoadWarning() = std::string("Unable to auto-load resolved TLK: ") + ex.what();
