@@ -9,6 +9,10 @@ NeoJRL is a purpose-built editor for BioWare journal files (`.jrl`). It supports
 - Neverwinter Nights
 - Neverwinter Nights 2
 
+Support is offered in the OpenKotOR Discord.
+
+[![OpenKotOR Discord](https://discordapp.com/api/guilds/739590575359262792/widget.png?style=banner2)](https://discord.gg/OpenKotOR)
+
 NeoJRL presents a journal as quests and journal states instead of requiring you to edit the underlying GFF structure by hand. It can create new journal files, add or remove complete quests, and add or remove the individual journal states within each quest.
 
 > Jade Empire uses the different QST quest format. Use **NeoQST** for `.qst` and `.qst2` files.
