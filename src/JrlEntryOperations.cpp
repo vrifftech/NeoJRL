@@ -524,12 +524,13 @@ void setJournalQuestLocalizedString(GffFile& journal,
                                     std::size_t questIndex,
                                     const std::string& label,
                                     UInt32 strref,
-                                    const std::optional<std::string>& language0Text) {
+                                    const std::optional<std::string>& languageText,
+                                    std::int32_t stringId) {
     GffStruct& quest = requireQuest(journal, questIndex);
     GffField* field = quest.GetFieldByLabel(label);
     if (field == nullptr) {
         auto localized = std::make_unique<GffLocalizedStringField>(label, strref);
-        if (language0Text) localized->SetStringByID(0, *language0Text);
+        if (languageText) localized->SetStringByID(stringId, *languageText);
         quest.AddField(std::move(localized));
     } else {
         if (field->fieldtype != FIELD_TYPE_CEXOLOCSTRING) {
@@ -537,7 +538,7 @@ void setJournalQuestLocalizedString(GffFile& journal,
         }
         auto& localized = static_cast<GffLocalizedStringField&>(*field);
         localized.strref = strref;
-        if (language0Text) localized.SetStringByID(0, *language0Text);
+        if (languageText) localized.SetStringByID(stringId, *languageText);
     }
     journal.dirty(true);
 }
@@ -596,12 +597,13 @@ void setJournalEntryLocalizedString(GffFile& journal,
                                     std::size_t entryIndex,
                                     const std::string& label,
                                     UInt32 strref,
-                                    const std::optional<std::string>& language0Text) {
+                                    const std::optional<std::string>& languageText,
+                                    std::int32_t stringId) {
     GffStruct& entry = requireEntry(journal, questIndex, entryIndex);
     GffField* field = entry.GetFieldByLabel(label);
     if (field == nullptr) {
         auto localized = std::make_unique<GffLocalizedStringField>(label, strref);
-        if (language0Text) localized->SetStringByID(0, *language0Text);
+        if (languageText) localized->SetStringByID(stringId, *languageText);
         entry.AddField(std::move(localized));
     } else {
         if (field->fieldtype != FIELD_TYPE_CEXOLOCSTRING) {
@@ -609,7 +611,7 @@ void setJournalEntryLocalizedString(GffFile& journal,
         }
         auto& localized = static_cast<GffLocalizedStringField&>(*field);
         localized.strref = strref;
-        if (language0Text) localized.SetStringByID(0, *language0Text);
+        if (languageText) localized.SetStringByID(stringId, *languageText);
     }
     journal.dirty(true);
 }

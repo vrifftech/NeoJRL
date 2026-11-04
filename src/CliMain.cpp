@@ -1,6 +1,7 @@
 #include "GFFFile.hpp"
 #include "GffTypeNames.hpp"
 #include "GffXml.hpp"
+#include <gff/GffText.hpp>
 #include "JrlEntryOperations.hpp"
 #include <neotlk/TlkLookup.hpp>
 #include "TabularData.hpp"
@@ -274,25 +275,17 @@ int searchGff(const std::filesystem::path& input, const std::string& term) {
     return 0;
 }
 
-std::string resolveStrRef(const GffLocalizedStringField& loc, const neotlk::TlkLookup* tlk) {
-    const std::string fallback = loc.GetStringById(0);
-    if (loc.strref == 0xFFFFFFFFu) {
-        return fallback;
-    }
-    if (tlk == nullptr) {
-        return "Bad StrRef";
-    }
-    const auto resolved = tlk->resolve(loc.strref);
-    return resolved.value_or(std::string("Bad StrRef"));
+std::string resolveStrRef(const GffLocalizedStringField& loc, const neotlk::TlkLookup* tlk, bool kotor) {
+    return neogff::resolveGffText(loc, tlk, kotor).value_or("Bad StrRef");
 }
 
 const GffField* field(const GffStruct& structure, const std::string& label) {
     return structure.GetFieldByLabel(label);
 }
 
-std::string fieldText(const GffStruct& structure, const std::string& label) {
+std::string fieldText(const GffStruct& structure, const std::string& label, std::uint32_t language = 0) {
     const GffField* f = field(structure, label);
-    return f ? f->GetString() : std::string();
+    return f ? neogff::decodeGffText(f->GetString(), language) : std::string();
 }
 
 const GffList& requireCategories(const GffFile& gff) {
@@ -315,15 +308,15 @@ std::size_t countEntries(const GffList& categories) {
     return total;
 }
 
-void printJournal(const GffList& categories, const neotlk::TlkLookup* tlk) {
+void printJournal(const GffList& categories, const neotlk::TlkLookup* tlk, bool kotor) {
     for (std::size_t i = 0; i < categories.count(); ++i) {
         const GffStruct* quest = categories.GetStruct(i);
         std::string name;
         const GffField* nameField = field(*quest, "Name");
         if (nameField != nullptr && nameField->fieldtype == FIELD_TYPE_CEXOLOCSTRING) {
-            name = resolveStrRef(static_cast<const GffLocalizedStringField&>(*nameField), tlk);
+            name = resolveStrRef(static_cast<const GffLocalizedStringField&>(*nameField), tlk, kotor);
         }
-        std::cout << i << "\t" << fieldText(*quest, "Tag") << "\t" << name << "\n";
+        std::cout << i << "\t" << fieldText(*quest, "Tag", tlk ? tlk->languageId() : 0) << "\t" << name << "\n";
 
         const GffField* entriesField = field(*quest, "EntryList");
         if (entriesField != nullptr && entriesField->fieldtype == FIELD_TYPE_LIST) {
@@ -333,7 +326,7 @@ void printJournal(const GffList& categories, const neotlk::TlkLookup* tlk) {
                 std::string text;
                 const GffField* textField = field(*stage, "Text");
                 if (textField != nullptr && textField->fieldtype == FIELD_TYPE_CEXOLOCSTRING) {
-                    text = resolveStrRef(static_cast<const GffLocalizedStringField&>(*textField), tlk);
+                    text = resolveStrRef(static_cast<const GffLocalizedStringField&>(*textField), tlk, kotor);
                 }
                 std::cout << "  " << j << "\tID=" << fieldText(*stage, "ID")
                           << "\tXP=" << fieldText(*stage, "XP_Percentage")
@@ -462,7 +455,7 @@ int main(int argc, char** argv) {
             tlk->load(std::filesystem::path(argv[2]));
         }
 
-        printJournal(categories, tlk.get());
+        printJournal(categories, tlk.get(), neojrl::detectJournalFlavor(gff) != neojrl::JournalFlavor::NeverwinterNights);
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << '\n';

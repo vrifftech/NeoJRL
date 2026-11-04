@@ -2,6 +2,7 @@
 #include <neoshared/GffResourceDocument.hpp>
 #include "GFFFile.hpp"
 #include "GffXml.hpp"
+#include <gff/GffText.hpp>
 #include "JrlEntryOperations.hpp"
 #include <neotlk/TlkLookup.hpp>
 #include "TabularData.hpp"
@@ -157,9 +158,9 @@ const GffField* field(const GffStruct& structure, const std::string& label) {
     return structure.GetFieldByLabel(label);
 }
 
-std::string fieldText(const GffStruct& structure, const std::string& label) {
+std::string fieldText(const GffStruct& structure, const std::string& label, std::uint32_t language = 0) {
     const GffField* f = field(structure, label);
-    return f ? f->GetString() : std::string();
+    return f ? neogff::decodeGffText(f->GetString(), language) : std::string();
 }
 
 const GffList& requireCategories(const GffFile& gff) {
@@ -220,15 +221,8 @@ const GffList* questEntries(const GffStruct& quest) {
     return &static_cast<const GffList&>(*listField);
 }
 
-std::string locStringText(const GffLocalizedStringField& loc, const neotlk::TlkLookup* tlk) {
-    if (loc.strref == kNoStrRef) {
-        return loc.GetStringById(0);
-    }
-    if (tlk == nullptr) {
-        return "Bad StrRef";
-    }
-    const auto resolved = tlk->resolve(loc.strref);
-    return resolved.value_or(std::string("Bad StrRef"));
+std::string locStringText(const GffLocalizedStringField& loc, const neotlk::TlkLookup* tlk, bool kotor) {
+    return neogff::resolveGffText(loc, tlk, kotor).value_or("Bad StrRef");
 }
 
 std::string locStrRefText(const GffStruct& structure, const std::string& label) {
@@ -240,10 +234,10 @@ std::string locStrRefText(const GffStruct& structure, const std::string& label) 
     return std::string();
 }
 
-std::string locResolvedText(const GffStruct& structure, const std::string& label, const neotlk::TlkLookup* tlk) {
+std::string locResolvedText(const GffStruct& structure, const std::string& label, const neotlk::TlkLookup* tlk, bool kotor) {
     const GffField* f = field(structure, label);
     if (f != nullptr && f->fieldtype == FIELD_TYPE_CEXOLOCSTRING) {
-        return locStringText(static_cast<const GffLocalizedStringField&>(*f), tlk);
+        return locStringText(static_cast<const GffLocalizedStringField&>(*f), tlk, kotor);
     }
     return std::string();
 }
@@ -1239,7 +1233,7 @@ private:
     std::string questFilterCell(std::size_t questIndex, const GffStruct& quest, std::size_t logicalColumn) const {
         switch (logicalColumn) {
             case 0: return std::to_string(questIndex);
-            case 1: return fieldText(quest, "Tag");
+            case 1: return fieldText(quest, "Tag", tlk() ? tlk()->languageId() : 0);
             default: return {};
         }
     }
@@ -1326,7 +1320,7 @@ private:
                 continue;
             }
             visibleQuests.push_back(i);
-            appendMappedRow(*questList_, {std::to_string(i), fieldText(*quest, "Tag")}, viewState(), i);
+            appendMappedRow(*questList_, {std::to_string(i), fieldText(*quest, "Tag", tlk() ? tlk()->languageId() : 0)}, viewState(), i);
         }
         neoview::setRowsFromLogicalRows(viewState(), visibleQuests);
         wxui::applyTheme(questList_, darkMode_);
@@ -1446,9 +1440,9 @@ private:
             profile_->SetValue(wxui::toWx(journalFlavorDisplayName(flavor)));
             updateQuestFieldVisibility(flavor);
             nameStrRef_->SetValue(wxui::toWx(locStrRefText(*quest, "Name")));
-            name_->SetValue(wxui::toWx(locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr)));
-            comment_->SetValue(wxui::toWx(fieldText(*quest, "Comment")));
-            tag_->SetValue(wxui::toWx(fieldText(*quest, "Tag")));
+            name_->SetValue(wxui::toWx(locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights)));
+            comment_->SetValue(wxui::toWx(fieldText(*quest, "Comment", tlk() ? tlk()->languageId() : 0)));
+            tag_->SetValue(wxui::toWx(fieldText(*quest, "Tag", tlk() ? tlk()->languageId() : 0)));
             planet_->SetValue(wxui::toWx(fieldText(*quest, "PlanetID")));
             priority_->SetValue(wxui::toWx(fieldText(*quest, "Priority")));
             plotIndex_->SetValue(wxui::toWx(fieldText(*quest, "PlotIndex")));
@@ -1479,7 +1473,7 @@ private:
             entryXp_->SetValue(wxui::toWx(fieldText(*stage, "XP_Percentage")));
             entryEnd_->SetValue(fieldText(*stage, "End") != "0");
             entryStrRef_->SetValue(wxui::toWx(locStrRefText(*stage, "Text")));
-            entryText_->SetValue(wxui::toWx(locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr)));
+            entryText_->SetValue(wxui::toWx(locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights)));
         } catch (const std::exception& ex) {
             wxui::showError(this, ex);
         }
@@ -1505,20 +1499,20 @@ private:
             const auto* quest = categories.GetStruct(qi);
             if (!quest) continue;
             for (const auto& fieldName : {"Tag", "Comment", "PlanetID", "Priority", "Picture", "PlotIndex", "XP"}) {
-                table.rows.push_back({"Quest", std::to_string(qi), "", fieldName, fieldText(*quest, fieldName)});
+                table.rows.push_back({"Quest", std::to_string(qi), "", fieldName, fieldText(*quest, fieldName, tlk() ? tlk()->languageId() : 0)});
             }
             table.rows.push_back({"Quest", std::to_string(qi), "", "Name(strref)", locStrRefText(*quest, "Name")});
-            table.rows.push_back({"Quest", std::to_string(qi), "", "Name(lang0)", locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr)});
+            table.rows.push_back({"Quest", std::to_string(qi), "", "Name(lang" + std::to_string(tlk() ? tlk()->languageId() * 2u : 0u) + ")", locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights)});
             const auto* entries = questEntries(*quest);
             if (!entries) continue;
             for (std::size_t si = 0; si < entries->count(); ++si) {
                 const auto* stage = entries->GetStruct(si);
                 if (!stage) continue;
                 for (const auto& fieldName : {"ID", "XP_Percentage", "End"}) {
-                    table.rows.push_back({"Entry", std::to_string(qi), std::to_string(si), fieldName, fieldText(*stage, fieldName)});
+                    table.rows.push_back({"Entry", std::to_string(qi), std::to_string(si), fieldName, fieldText(*stage, fieldName, tlk() ? tlk()->languageId() : 0)});
                 }
                 table.rows.push_back({"Entry", std::to_string(qi), std::to_string(si), "Text(strref)", locStrRefText(*stage, "Text")});
-                table.rows.push_back({"Entry", std::to_string(qi), std::to_string(si), "Text(lang0)", locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr)});
+                table.rows.push_back({"Entry", std::to_string(qi), std::to_string(si), "Text(lang" + std::to_string(tlk() ? tlk()->languageId() * 2u : 0u) + ")", locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights)});
             }
         }
         return table;
@@ -1532,16 +1526,16 @@ private:
         const auto* quest = categories.GetStruct(*viewState().primarySelection);
         if (!quest) return table;
         for (const auto& fieldName : {"Tag", "Comment", "PlanetID", "Priority", "Picture", "PlotIndex", "XP"}) {
-            table.rows.push_back({"Quest", std::to_string(*viewState().primarySelection), "", fieldName, fieldText(*quest, fieldName)});
+            table.rows.push_back({"Quest", std::to_string(*viewState().primarySelection), "", fieldName, fieldText(*quest, fieldName, tlk() ? tlk()->languageId() : 0)});
         }
         if (viewState().secondarySelection) {
             const auto* stage = selectedEntry(*viewState().secondarySelection);
             if (stage) {
                 for (const auto& fieldName : {"ID", "XP_Percentage", "End"}) {
-                    table.rows.push_back({"Entry", std::to_string(*viewState().primarySelection), std::to_string(*viewState().secondarySelection), fieldName, fieldText(*stage, fieldName)});
+                    table.rows.push_back({"Entry", std::to_string(*viewState().primarySelection), std::to_string(*viewState().secondarySelection), fieldName, fieldText(*stage, fieldName, tlk() ? tlk()->languageId() : 0)});
                 }
                 table.rows.push_back({"Entry", std::to_string(*viewState().primarySelection), std::to_string(*viewState().secondarySelection), "Text(strref)", locStrRefText(*stage, "Text")});
-                table.rows.push_back({"Entry", std::to_string(*viewState().primarySelection), std::to_string(*viewState().secondarySelection), "Text(lang0)", locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr)});
+                table.rows.push_back({"Entry", std::to_string(*viewState().primarySelection), std::to_string(*viewState().secondarySelection), "Text(lang" + std::to_string(tlk() ? tlk()->languageId() * 2u : 0u) + ")", locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights)});
             }
         }
         return table;
@@ -1559,7 +1553,10 @@ private:
             if (questText.empty()) continue;
             const auto questIndex = static_cast<std::size_t>(std::stoull(questText));
             const auto fieldName = tableCell(row, fieldCol);
-            const auto value = tableCell(row, valueCol);
+            const auto stringIdPos = fieldName.rfind("(lang");
+            const auto language = stringIdPos == std::string::npos ? (tlk() ? tlk()->languageId() : 0)
+                : static_cast<std::uint32_t>(std::stoul(fieldName.substr(stringIdPos + 5))) / 2;
+            const auto value = neogff::encodeGffText(tableCell(row, valueCol), language);
             if (kind == "quest") {
                 gff().ChangeFieldValue(pathForQuest(questIndex, fieldName), value);
             } else if (kind == "entry") {
@@ -2037,8 +2034,8 @@ private:
             const GffStruct* quest = categories.GetStruct(questIndex);
             if (quest == nullptr) throw std::runtime_error("The selected quest no longer exists.");
 
-            const std::string tag = fieldText(*quest, "Tag");
-            std::string name = locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr);
+            const std::string tag = fieldText(*quest, "Tag", tlk() ? tlk()->languageId() : 0);
+            std::string name = locResolvedText(*quest, "Name", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights);
             if (name.empty()) name = "(unnamed quest)";
             const GffList* entries = questEntries(*quest);
             const std::size_t entryCount = entries == nullptr ? 0 : entries->count();
@@ -2089,10 +2086,14 @@ private:
             const UInt32 nameStrRef = parseRequiredStrRef(*nameStrRef_, "Name StrRef");
             setJournalQuestLocalizedString(
                 gff(), index, "Name", nameStrRef,
-                nameStrRef == kNoStrRef ? std::optional<std::string>{wxui::toStd(name_->GetValue())}
-                                        : std::nullopt);
-            changeJournalQuestTag(gff(), index, wxui::toStd(tag_->GetValue()));
-            setJournalQuestOptionalString(gff(), index, "Comment", optionalText(*comment_));
+                nameStrRef == kNoStrRef || name_->IsModified()
+                    ? std::optional<std::string>{neogff::encodeGffText(wxui::toStd(name_->GetValue()), tlk() ? tlk()->languageId() : 0)}
+                    : std::nullopt,
+                tlk() ? std::int32_t(tlk()->languageId() * 2u) : 0);
+            changeJournalQuestTag(gff(), index, neogff::encodeGffText(wxui::toStd(tag_->GetValue()), tlk() ? tlk()->languageId() : 0));
+            auto comment = optionalText(*comment_);
+            if (comment) *comment = neogff::encodeGffText(*comment, tlk() ? tlk()->languageId() : 0);
+            setJournalQuestOptionalString(gff(), index, "Comment", comment);
             setJournalQuestOptionalDword(gff(), index, "Priority", parseOptionalDword(*priority_, "Sort priority"));
             setJournalQuestOptionalWord(gff(), index, "Picture", parseOptionalWord(*picture_, "Journal picture ID"));
 
@@ -2136,8 +2137,10 @@ private:
             const UInt32 textStrRef = parseRequiredStrRef(*entryStrRef_, "Entry StrRef");
             setJournalEntryLocalizedString(
                 gff(), questIndex, entryIndex, "Text", textStrRef,
-                textStrRef == kNoStrRef ? std::optional<std::string>{wxui::toStd(entryText_->GetValue())}
-                                        : std::nullopt);
+                textStrRef == kNoStrRef || entryText_->IsModified()
+                    ? std::optional<std::string>{neogff::encodeGffText(wxui::toStd(entryText_->GetValue()), tlk() ? tlk()->languageId() : 0)}
+                    : std::nullopt,
+                tlk() ? std::int32_t(tlk()->languageId() * 2u) : 0);
 
             refreshEntries(questIndex);
             selectEntryIndex(entryIndex);
@@ -2404,7 +2407,7 @@ private:
                 }
                 for (std::size_t si = 0; si < entries->count(); ++si) {
                     const auto* stage = entries->GetStruct(si);
-                    if (stage != nullptr && containsInsensitive(locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr), text)) {
+                    if (stage != nullptr && containsInsensitive(locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights), text)) {
                         selectQuestIndex(qi);
                         loadSelectedQuest();
                         selectEntryIndex(si);
@@ -2419,8 +2422,8 @@ private:
 
     bool matchesQuest(int mode, const GffStruct& quest, const std::string& text) const {
         switch (mode) {
-            case 0: return containsInsensitive(fieldText(quest, "Tag"), text);
-            case 1: return containsInsensitive(locResolvedText(quest, "Name", tlk().has_value() ? &*tlk() : nullptr), text);
+            case 0: return containsInsensitive(fieldText(quest, "Tag", tlk() ? tlk()->languageId() : 0), text);
+            case 1: return containsInsensitive(locResolvedText(quest, "Name", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights), text);
             case 3: return containsInsensitive(fieldText(quest, "PlanetID"), text);
             case 4: return containsInsensitive(fieldText(quest, "Priority"), text);
             case 5: return containsInsensitive(fieldText(quest, "PlotIndex"), text);

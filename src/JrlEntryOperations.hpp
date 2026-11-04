@@ -88,7 +88,8 @@ void setJournalQuestLocalizedString(GffFile& journal,
                                     std::size_t questIndex,
                                     const std::string& label,
                                     UInt32 strref,
-                                    const std::optional<std::string>& language0Text);
+                                    const std::optional<std::string>& languageText,
+                                    std::int32_t stringId = 0);
 void setJournalQuestOptionalInt(GffFile& journal,
                                 std::size_t questIndex,
                                 const std::string& label,
@@ -111,7 +112,8 @@ void setJournalEntryLocalizedString(GffFile& journal,
                                     std::size_t entryIndex,
                                     const std::string& label,
                                     UInt32 strref,
-                                    const std::optional<std::string>& language0Text);
+                                    const std::optional<std::string>& languageText,
+                                    std::int32_t stringId = 0);
 
 void setJournalEntryDword(GffFile& journal,
                           std::size_t questIndex,
