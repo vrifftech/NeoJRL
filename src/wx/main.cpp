@@ -37,7 +37,7 @@ private:
 };
 class NeoJRLApp final:public wxApp {
 public:bool OnInit()override {
-    SetAppName("NeoJRL");SetVendorName("Neo Tools");wxInitAllImageHandlers();
+    SetAppName("NeoJRL");SetVendorName("Neo Tools");wxui::initializeTheme("NeoJRL");wxInitAllImageHandlers();
     auto* frame=new NeoJRLFrame;frame->Show();
     if(argc>1){const auto path=neosettings::pathFromWx(wxString(argv[1]));frame->CallAfter([frame,path]{frame->openStartup(path);});}
     return true;
