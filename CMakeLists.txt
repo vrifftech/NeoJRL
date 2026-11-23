@@ -184,6 +184,7 @@ if(NEOJRL_BUILD_WX_GUI OR NEOJRL_BUILD_WX_MODULE)
             SLUG "neojrl"
             ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/neojrl.svg"
         )
+        neo_enable_updates(NeoJRL "NeoJRL" "${PROJECT_VERSION}")
         target_link_libraries(NeoJRL PRIVATE neojrl_wx)
         target_include_directories(NeoJRL PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/resources)
         target_link_libraries(NeoJRL PRIVATE neoshared::wx)
