@@ -40,7 +40,7 @@ class NeoJRLApp final:public wxApp {
 public:bool OnInit()override {
     SetAppName("NeoJRL");SetVendorName("Neo Tools");wxui::initializeTheme("NeoJRL");wxInitAllImageHandlers();
     auto* frame=new NeoJRLFrame;frame->Show();
-#if !defined(__EMSCRIPTEN__)
+#if defined(NEO_UPDATE_APPLICATION)
         neoupdate::install(*frame, NEO_UPDATE_APPLICATION, NEO_UPDATE_VERSION);
 #endif
 
