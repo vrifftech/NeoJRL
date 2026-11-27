@@ -28,6 +28,8 @@
 #include <wx/iconbndl.h>
 #include <wx/listctrl.h>
 #include <wx/sizer.h>
+#include <wx/wrapsizer.h>
+#include <wx/scrolwin.h>
 #include <wx/splitter.h>
 #include <wx/statbox.h>
 #include <wx/wx.h>
@@ -416,7 +418,7 @@ public:
         return false;
     }
     std::size_t documentCount() const override { return documents_.size(); }
-    bool openFile(const std::filesystem::path& path) override { if(path.empty()) return false; openJrlPath(path); return true; }
+    bool openFile(const std::filesystem::path& path) override { if(!commitPending() || path.empty()) return false; openJrlPath(path); return true; }
     neogff::GffFile* activeFile() override { return hasActiveDocument() ? &gff() : nullptr; }
     void refreshActiveDocument() override { if (hasActiveDocument()) refreshQuests(); }
     void setAppearance(bool dark, double scale) override { darkMode_=dark; fontScale_=scale; applyDarkMode(); }
@@ -433,6 +435,7 @@ public:
         return result;
     }
     bool openResource(neoshared::ResourceDocument input) override {
+        if (!commitPending()) return false;
         if (activateResource(input.identity)) return true;
         auto candidate = std::make_unique<neogff::GffFile>();
         neoshared::loadGffResource(input, *candidate, "JRL ");
@@ -531,7 +534,8 @@ private:
     }
 
     bool tabDirty(const DocumentTab& tab) const {
-        return tab.saveInProgress || (tab.gff && tab.gff->dirty());
+        return tab.saveInProgress || (tab.gff && tab.gff->dirty()) ||
+            (hasActiveDocument() && &tab == &activeDocument() && (questPending() || entryPending()));
     }
 
     std::string tabDisplayName(const DocumentTab& tab) const {
@@ -690,6 +694,7 @@ private:
     }
 
     void selectDocumentTab(std::size_t index) {
+        if (!commitPending()) return;
         if (documentTabs_ == nullptr || index >= documents_.size()) return;
         tabSwitchInProgress_ = true;
         const bool selected = neotabs::changeSelectionToPage(documentTabs_, documents_[index].tabPage);
@@ -709,12 +714,20 @@ private:
             return false;
         }
         if (!tabDirty(documents_[index])) return true;
-        return wxui::confirm(this, "Close tab", neotabs::closePromptText(tabDisplayName(documents_[index])));
+        if (index != activeDocumentIndex_) selectDocumentTab(index);
+        if (index != activeDocumentIndex_) return false;
+        const int answer = wxMessageBox(wxui::toWx("Save changes to " + tabDisplayName(documents_[index]) + "?"),
+            "Close document", wxYES_NO | wxCANCEL | wxICON_QUESTION, this);
+        if (answer == wxCANCEL) return false;
+        if (answer == wxNO) { discardPending(); loadSelectedQuest(); updateActiveTabTitle(); return true; }
+        wxCommandEvent event; onSave(event);
+        return !tabDirty(documents_[index]);
     }
 
     bool closeDocumentTab(std::size_t index) {
         if (index >= documents_.size() || !confirmCloseDocumentTab(index)) return false;
 
+        if (index == activeDocumentIndex_) discardPending();
         wxWindow* const page = documents_[index].tabPage;
         tabSwitchInProgress_ = true;
         const bool deleted = neotabs::deleteTabPage(documentTabs_, page);
@@ -736,8 +749,10 @@ private:
     }
 
     bool confirmCloseAllTabs() {
+        const auto active = activeDocumentIndex_;
+        if (!confirmCloseDocumentTab(active)) return false;
         for (std::size_t i = 0; i < documents_.size(); ++i) {
-            if (!confirmCloseDocumentTab(i)) return false;
+            if (i != active && !confirmCloseDocumentTab(i)) return false;
         }
         return true;
     }
@@ -795,7 +810,7 @@ private:
     }
 
     void openJrlPath(const std::filesystem::path& path) {
-        if (path.empty()) return;
+        if (path.empty() || !commitPending()) return;
         for (std::size_t i=0; i<documents_.size(); ++i) {
             if (neoshared::sameResourcePath(path, documentFilename(documents_[i]))) {
                 selectDocumentTab(i); return;
@@ -949,7 +964,8 @@ private:
 
         auto* main = new wxSplitterWindow(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxSP_LIVE_UPDATE);
         auto* left = new wxPanel(main);
-        auto* right = new wxPanel(main);
+        auto* right = new wxScrolledWindow(main);
+        right->SetScrollRate(0, FromDIP(12));
 
         auto* leftSizer = new wxBoxSizer(wxVERTICAL);
         leftSizer->Add(new wxStaticText(left, wxID_ANY, "Quests"), 0, wxLEFT | wxTOP, 4);
@@ -968,6 +984,7 @@ private:
         rightSizer->Add(buildQuestPanel(right), 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
         rightSizer->Add(buildEntryListAndPanel(right), 1, wxEXPAND | wxALL, 4);
         right->SetSizer(rightSizer);
+        right->FitInside();
 
         main->SplitVertically(left, right);
         main->SetSashGravity(0.30);
@@ -1025,7 +1042,7 @@ private:
 
     wxSizer* buildQuestPanel(wxWindow* parent) {
         auto* box = new wxStaticBoxSizer(wxVERTICAL, parent, "Quest");
-        auto* form = new wxFlexGridSizer(2, 2, 5, 8);
+        auto* form = new wxFlexGridSizer(0, 2, 5, 8);
         form->AddGrowableCol(1, 1);
 
         profileLabel_ = new wxStaticText(parent, wxID_ANY, "Detected profile");
@@ -1064,7 +1081,7 @@ private:
         entryList_->SetName("NeoJRL entries");
         wxui::setColumns(*entryList_, {{"#", 55}, {"ID", 95}});
         entriesSizer->Add(entryList_, 1, wxEXPAND | wxALL, 4);
-        auto* entryButtons = new wxBoxSizer(wxHORIZONTAL);
+        auto* entryButtons = new wxWrapSizer(wxHORIZONTAL);
         entryButtons->Add(new wxButton(entriesPanel, ID_NewEntry, "New Entry"), 0, wxRIGHT, 4);
         entryButtons->Add(new wxButton(entriesPanel, ID_DeleteEntry, "Delete Entry"), 0);
         entriesSizer->Add(entryButtons, 0, wxLEFT | wxRIGHT | wxBOTTOM, 4);
@@ -1085,6 +1102,7 @@ private:
         entryText_ = new wxTextCtrl(detailPanel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize,
                                     wxTE_MULTILINE | wxTE_RICH2);
         entryText_->SetName("NeoJRL entry text");
+        entryText_->SetMinSize(FromDIP(wxSize(160, 120)));
         detailSizer->Add(entryText_, 1, wxEXPAND | wxALL, 6);
         auto* row = new wxBoxSizer(wxHORIZONTAL);
         row->AddStretchSpacer(1);
@@ -1092,6 +1110,7 @@ private:
         detailSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 6);
         detailPanel->SetSizer(detailSizer);
 
+        splitter->SetMinSize(wxSize(-1, detailSizer->GetMinSize().y));
         splitter->SplitVertically(entriesPanel, detailPanel);
         splitter->SetSashGravity(0.35);
         splitter->SetMinimumPaneSize(FromDIP(140));
@@ -1152,6 +1171,13 @@ private:
         Bind(wxEVT_MENU, [this](wxCommandEvent&) {
             wxui::showMessage(this, "About NeoJRL", std::string("NeoJRL v") + kVersion + "\nNative wxWidgets journal editor\n\nA special thanks to everyone in the KOTOR modding community that has contributed their work, knowledge, and creativity to making tools, mods, and guides over the last 20+ years");
         }, ID_ModuleAbout);
+        Bind(wxEVT_MENU, [this](wxCommandEvent& event) {
+            if (event.GetId() == ID_CloseTab || event.GetId() == ID_CloseOtherTabs ||
+                event.GetId() == ID_ModuleExit || commitPending()) event.Skip();
+        });
+        documentTabs_->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGING, [this](wxAuiNotebookEvent& event) {
+            if (!tabSwitchInProgress_ && !commitPending()) event.Veto(); else event.Skip();
+        });
         documentTabs_->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, &NeoJRLPanelImpl::onDocumentTabChanged, this);
         documentTabs_->Bind(wxEVT_AUINOTEBOOK_PAGE_CLOSE, &NeoJRLPanelImpl::onDocumentTabCloseRequested, this);
 
@@ -1166,8 +1192,23 @@ private:
         Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_DeleteQuest);
         Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_NewEntry);
         Bind(wxEVT_BUTTON, &NeoJRLPanelImpl::dispatchButton, this, ID_DeleteEntry);
-        questList_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) { loadSelectedQuest(); });
-        entryList_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) { loadSelectedEntry(); });
+        for(auto* field:{nameStrRef_,name_,tag_,comment_,priority_,picture_,planet_,plotIndex_,questXp_,entryId_,entryXp_,entryStrRef_,entryText_})
+            field->Bind(wxEVT_TEXT,[this](wxCommandEvent& event){updateActiveTabTitle();event.Skip();});
+        entryEnd_->Bind(wxEVT_CHECKBOX,[this](wxCommandEvent&){entryEndEdited_=true;updateActiveTabTitle();});
+        questList_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) {
+            if (restoringSelection_) return;
+            if (commitPending()) loadSelectedQuest();
+            else if (viewState().primarySelection) {
+                restoringSelection_ = true; selectQuestIndex(*viewState().primarySelection); restoringSelection_ = false;
+            }
+        });
+        entryList_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) {
+            if (restoringSelection_) return;
+            if (commitPending()) loadSelectedEntry();
+            else if (viewState().secondarySelection) {
+                restoringSelection_ = true; selectEntryIndex(*viewState().secondarySelection); restoringSelection_ = false;
+            }
+        });
         questList_->Bind(wxEVT_LIST_COL_RIGHT_CLICK, &NeoJRLPanelImpl::onQuestColumnRightClick, this);
         entryList_->Bind(wxEVT_LIST_COL_RIGHT_CLICK, &NeoJRLPanelImpl::onEntryColumnRightClick, this);
     }
@@ -1409,6 +1450,7 @@ private:
     }
 
     void clearEntryPanel() {
+        entryEndEdited_ = false;
         entryId_->Clear();
         entryXp_->Clear();
         entryStrRef_->Clear();
@@ -1472,6 +1514,7 @@ private:
             entryId_->SetValue(wxui::toWx(fieldText(*stage, "ID")));
             entryXp_->SetValue(wxui::toWx(fieldText(*stage, "XP_Percentage")));
             entryEnd_->SetValue(fieldText(*stage, "End") != "0");
+            entryEndEdited_ = false;
             entryStrRef_->SetValue(wxui::toWx(locStrRefText(*stage, "Text")));
             entryText_->SetValue(wxui::toWx(locResolvedText(*stage, "Text", tlk().has_value() ? &*tlk() : nullptr, authoringFlavor() != JournalFlavor::NeverwinterNights)));
         } catch (const std::exception& ex) {
@@ -1858,6 +1901,7 @@ private:
     }
 
     bool saveTo(const std::filesystem::path& target) {
+        if (!commitPending()) return false;
         if (target.empty() || !hasActiveDocument() || !gff().loaded()) return false;
         if (activeDocument().saveInProgress || browserSaveActive_) return false;
 
@@ -1928,6 +1972,7 @@ private:
                 }
 
                 savedDocument.logicalFilename = target;
+                savedDocument.resourceIdentity.clear();
                 savedDocument.gff->dirty(false);
                 const JournalFlavor detected = detectJournalFlavor(*savedDocument.gff);
                 if (detected != JournalFlavor::Unknown) {
@@ -1944,6 +1989,7 @@ private:
         return true;
 #else
         document.logicalFilename = target;
+        document.resourceIdentity.clear();
         document.gff->dirty(false);
         const JournalFlavor detected = detectJournalFlavor(*document.gff);
         if (detected != JournalFlavor::Unknown) document.authoringFlavor = detected;
@@ -2074,83 +2120,105 @@ private:
         }
     }
 
+    bool questPending() const {
+        if (!hasActiveDocument() || !viewState().primarySelection) return false;
+        for (auto* field : {nameStrRef_, name_, tag_, comment_, priority_, picture_, planet_, plotIndex_, questXp_})
+            if (field->IsModified()) return true;
+        return false;
+    }
+
+    bool entryPending() const {
+        if (!hasActiveDocument() || !viewState().secondarySelection) return false;
+        return entryEndEdited_ || entryId_->IsModified() || entryXp_->IsModified() ||
+            entryStrRef_->IsModified() || entryText_->IsModified();
+    }
+
+    void discardPending() {
+        for (auto* field : {nameStrRef_, name_, tag_, comment_, priority_, picture_, planet_, plotIndex_, questXp_,
+                           entryId_, entryXp_, entryStrRef_, entryText_}) field->DiscardEdits();
+        entryEndEdited_ = false;
+    }
+
+    void applyQuest(std::size_t index) {
+        JournalFlavor flavor = detectJournalQuestFlavor(gff(), index);
+        if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
+
+        const auto priority = parseOptionalDword(*priority_, "Sort priority");
+        const auto picture = parseOptionalWord(*picture_, "Journal picture ID");
+        const auto planet = flavor != JournalFlavor::NeverwinterNights ? parseOptionalInt32(*planet_, "Planet ID") : std::nullopt;
+        const auto plotIndex = flavor != JournalFlavor::NeverwinterNights ? parseOptionalInt32(*plotIndex_, "PlotXP.2da row") : std::nullopt;
+        const auto questXp = flavor != JournalFlavor::Kotor ? parseOptionalDword(*questXp_, "Quest XP") : std::nullopt;
+        const UInt32 nameStrRef = parseRequiredStrRef(*nameStrRef_, "Name StrRef");
+        setJournalQuestLocalizedString(
+            gff(), index, "Name", nameStrRef,
+            nameStrRef == kNoStrRef || name_->IsModified()
+                ? std::optional<std::string>{neogff::encodeGffText(wxui::toStd(name_->GetValue()), tlk() ? tlk()->languageId() : 0)}
+                : std::nullopt,
+            tlk() ? std::int32_t(tlk()->languageId() * 2u) : 0);
+        changeJournalQuestTag(gff(), index, neogff::encodeGffText(wxui::toStd(tag_->GetValue()), tlk() ? tlk()->languageId() : 0));
+        auto comment = optionalText(*comment_);
+        if (comment) *comment = neogff::encodeGffText(*comment, tlk() ? tlk()->languageId() : 0);
+        setJournalQuestOptionalString(gff(), index, "Comment", comment);
+        setJournalQuestOptionalDword(gff(), index, "Priority", priority);
+        setJournalQuestOptionalWord(gff(), index, "Picture", picture);
+
+        if (flavor != JournalFlavor::NeverwinterNights) {
+            setJournalQuestOptionalInt(gff(), index, "PlanetID", planet);
+            setJournalQuestOptionalInt(gff(), index, "PlotIndex", plotIndex);
+        }
+        if (flavor != JournalFlavor::Kotor) {
+            setJournalQuestOptionalDword(gff(), index, "XP", questXp);
+        }
+
+    }
+
+    void applyEntry(std::size_t questIndex, std::size_t entryIndex) {
+        JournalFlavor flavor = detectJournalQuestFlavor(gff(), questIndex);
+        if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
+
+        const auto entryId = parseRequiredDword(*entryId_, "Entry ID");
+        const auto entryXp = flavor != JournalFlavor::NeverwinterNights ? parseOptionalFloat(*entryXp_, "Plot XP multiplier") : std::nullopt;
+        const UInt32 textStrRef = parseRequiredStrRef(*entryStrRef_, "Entry StrRef");
+        changeJournalEntryId(gff(), questIndex, entryIndex,
+                             entryId);
+        setJournalEntryWord(gff(), questIndex, entryIndex, "End", entryEnd_->GetValue() ? 1u : 0u);
+        if (flavor != JournalFlavor::NeverwinterNights) {
+            setJournalEntryOptionalFloat(gff(), questIndex, entryIndex, "XP_Percentage",
+                                         entryXp);
+        }
+
+        setJournalEntryLocalizedString(
+            gff(), questIndex, entryIndex, "Text", textStrRef,
+            textStrRef == kNoStrRef || entryText_->IsModified()
+                ? std::optional<std::string>{neogff::encodeGffText(wxui::toStd(entryText_->GetValue()), tlk() ? tlk()->languageId() : 0)}
+                : std::nullopt,
+            tlk() ? std::int32_t(tlk()->languageId() * 2u) : 0);
+
+    }
+
+    bool commitPending() {
+        try {
+            if (questPending()) applyQuest(*viewState().primarySelection);
+            if (entryPending()) applyEntry(*viewState().primarySelection, *viewState().secondarySelection);
+            discardPending();
+            updateActiveTabTitle();
+            return true;
+        } catch (const std::exception& ex) {
+            wxui::showError(this, ex);
+            return false;
+        }
+    }
+
     void onApplyQuest(wxCommandEvent&) {
-        try {
-            ensureLoaded();
-            const long row = wxui::selectedRow(*questList_);
-            if (row < 0) throw std::runtime_error("Select a quest first.");
-            const auto index = static_cast<std::size_t>(questList_->GetItemData(row));
-            JournalFlavor flavor = detectJournalQuestFlavor(gff(), index);
-            if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
-
-            const UInt32 nameStrRef = parseRequiredStrRef(*nameStrRef_, "Name StrRef");
-            setJournalQuestLocalizedString(
-                gff(), index, "Name", nameStrRef,
-                nameStrRef == kNoStrRef || name_->IsModified()
-                    ? std::optional<std::string>{neogff::encodeGffText(wxui::toStd(name_->GetValue()), tlk() ? tlk()->languageId() : 0)}
-                    : std::nullopt,
-                tlk() ? std::int32_t(tlk()->languageId() * 2u) : 0);
-            changeJournalQuestTag(gff(), index, neogff::encodeGffText(wxui::toStd(tag_->GetValue()), tlk() ? tlk()->languageId() : 0));
-            auto comment = optionalText(*comment_);
-            if (comment) *comment = neogff::encodeGffText(*comment, tlk() ? tlk()->languageId() : 0);
-            setJournalQuestOptionalString(gff(), index, "Comment", comment);
-            setJournalQuestOptionalDword(gff(), index, "Priority", parseOptionalDword(*priority_, "Sort priority"));
-            setJournalQuestOptionalWord(gff(), index, "Picture", parseOptionalWord(*picture_, "Journal picture ID"));
-
-            if (flavor != JournalFlavor::NeverwinterNights) {
-                setJournalQuestOptionalInt(gff(), index, "PlanetID", parseOptionalInt32(*planet_, "Planet ID"));
-                setJournalQuestOptionalInt(gff(), index, "PlotIndex", parseOptionalInt32(*plotIndex_, "PlotXP.2da row"));
-            }
-            if (flavor != JournalFlavor::Kotor) {
-                setJournalQuestOptionalDword(gff(), index, "XP", parseOptionalDword(*questXp_, "Quest XP"));
-            }
-
-            refreshQuests();
-            selectQuestIndex(index);
-            loadSelectedQuest();
-            updateActiveTabTitle();
-            setModuleStatusText("Quest changes applied.", 1);
-        } catch (const std::exception& ex) {
-            wxui::showError(this, ex);
-        }
+        if (!commitPending()) return;
+        const auto quest = viewState().primarySelection;
+        const auto entry = viewState().secondarySelection;
+        refreshQuests();
+        if (quest) selectQuestIndex(*quest);
+        if (entry) selectEntryIndex(*entry);
     }
 
-    void onApplyEntry(wxCommandEvent&) {
-        try {
-            ensureLoaded();
-            if (!viewState().primarySelection) throw std::runtime_error("Select a quest first.");
-            const long row = wxui::selectedRow(*entryList_);
-            if (row < 0) throw std::runtime_error("Select an entry first.");
-            const auto questIndex = *viewState().primarySelection;
-            const auto entryIndex = static_cast<std::size_t>(entryList_->GetItemData(row));
-            JournalFlavor flavor = detectJournalQuestFlavor(gff(), questIndex);
-            if (flavor == JournalFlavor::Unknown) flavor = detectJournalFlavor(gff());
-
-            changeJournalEntryId(gff(), questIndex, entryIndex,
-                                 parseRequiredDword(*entryId_, "Entry ID"));
-            setJournalEntryWord(gff(), questIndex, entryIndex, "End", entryEnd_->GetValue() ? 1u : 0u);
-            if (flavor != JournalFlavor::NeverwinterNights) {
-                setJournalEntryOptionalFloat(gff(), questIndex, entryIndex, "XP_Percentage",
-                                             parseOptionalFloat(*entryXp_, "Plot XP multiplier"));
-            }
-
-            const UInt32 textStrRef = parseRequiredStrRef(*entryStrRef_, "Entry StrRef");
-            setJournalEntryLocalizedString(
-                gff(), questIndex, entryIndex, "Text", textStrRef,
-                textStrRef == kNoStrRef || entryText_->IsModified()
-                    ? std::optional<std::string>{neogff::encodeGffText(wxui::toStd(entryText_->GetValue()), tlk() ? tlk()->languageId() : 0)}
-                    : std::nullopt,
-                tlk() ? std::int32_t(tlk()->languageId() * 2u) : 0);
-
-            refreshEntries(questIndex);
-            selectEntryIndex(entryIndex);
-            loadSelectedEntry();
-            updateActiveTabTitle();
-            setModuleStatusText("Entry changes applied.", 1);
-        } catch (const std::exception& ex) {
-            wxui::showError(this, ex);
-        }
-    }
+    void onApplyEntry(wxCommandEvent& event) { onApplyQuest(event); }
 
     void onNewEntry(wxCommandEvent&) {
         try {
@@ -2497,6 +2565,8 @@ private:
     std::vector<DocumentTab> documents_;
     std::size_t activeDocumentIndex_ = neotabs::npos;
     bool tabSwitchInProgress_ = false;
+    bool entryEndEdited_ = false;
+    bool restoringSelection_ = false;
     int contextVisualColumn_ = 0;
     bool contextListIsEntry_ = false;
     bool browserSaveActive_ = false;
